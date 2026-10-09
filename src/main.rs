@@ -1,4 +1,5 @@
 mod config;
+mod packet;
 mod tcp;
 
 use std::{io::IsTerminal, path::PathBuf};
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         result = tcp::run(&config.listen) => result,
+        result = packet::run(config.packet.as_ref(), args.verbose) => result,
         _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
     }

@@ -6,7 +6,7 @@ Linux 双栈透明流量处理工具。
 cargo build --release
 ```
 
-在 `examples/freedomharbor.nft` 中填写 LAN、WAN 接口，并使转发端口与 TOML 配置一致。示例使用标记 `0x1`、路由表 `100`，宿主防火墙需要允许导入的 TCP 流量。
+安装 `nfqws2`，在 TOML 中设置其 Lua 库目录。在 `examples/freedomharbor.nft` 中填写 LAN、WAN 接口，转发端口与队列编号对应 TOML 配置。示例使用标记 `0x1`、`0x20000000`、`0x40000000` 和路由表 `100`，宿主防火墙需要允许导入的 TCP 流量。
 
 ```sh
 sudo ip rule add fwmark 0x1 lookup 100

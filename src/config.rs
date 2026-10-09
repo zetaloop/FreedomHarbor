@@ -1,7 +1,7 @@
 use std::{
     fs,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub listen: Vec<SocketAddr>,
+    pub packet: Option<Packet>,
 }
 
 impl Default for Config {
@@ -20,6 +21,27 @@ impl Default for Config {
                 (Ipv4Addr::LOCALHOST, 15000).into(),
                 (Ipv6Addr::LOCALHOST, 15000).into(),
             ],
+            packet: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Packet {
+    pub queue: u16,
+    pub lua: PathBuf,
+    pub tls: Vec<String>,
+    pub quic: Vec<String>,
+}
+
+impl Default for Packet {
+    fn default() -> Self {
+        Self {
+            queue: 200,
+            lua: "/usr/share/zapret2/lua".into(),
+            tls: vec!["multidisorder:pos=2,midsld".into()],
+            quic: vec!["fake:blob=fake_default_quic".into()],
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr};
+use std::{future::pending, io, net::SocketAddr};
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Socket, Type};
@@ -35,7 +35,7 @@ pub async fn run(addresses: &[SocketAddr]) -> Result<()> {
     while let Some(result) = listeners.join_next().await {
         result.context("listener task failed")??;
     }
-    Ok(())
+    pending().await
 }
 
 async fn accept(listener: TcpListener) -> io::Result<()> {
