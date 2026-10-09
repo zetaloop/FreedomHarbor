@@ -1,0 +1,14 @@
+define lan = "lan0"
+define wan = "wan0"
+define port = 15000
+define intercept = 0x1
+
+table inet freedomharbor {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+
+        iifname $lan meta l4proto tcp socket transparent 1 meta mark set $intercept accept
+        iifname $lan meta l4proto tcp fib daddr oifname $wan meta nfproto ipv4 tproxy ip to 127.0.0.1:$port meta mark set $intercept accept
+        iifname $lan meta l4proto tcp fib daddr oifname $wan meta nfproto ipv6 tproxy ip6 to [::1]:$port meta mark set $intercept accept
+    }
+}
