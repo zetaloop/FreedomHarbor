@@ -1,0 +1,327 @@
+use std::{
+    convert::Infallible,
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use anyhow::{Context as _, Result};
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
+    header::{CACHE_CONTROL, CONNECTION, HOST, LOCATION, TE, TRANSFER_ENCODING, UPGRADE},
+    uri::{Authority, Scheme},
+};
+use http_body_util::{Either, Empty};
+use hyper::{
+    body::{Bytes, Incoming},
+    service::service_fn,
+    upgrade,
+};
+use hyper_util::{
+    client::legacy::Client,
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
+use tokio::io::copy_bidirectional;
+use tower_service::Service;
+use tracing::{debug, warn};
+
+use crate::{body::Body, config, https, stream::Stream};
+
+pub type Connecting = Pin<Box<dyn Future<Output = io::Result<Stream>> + Send>>;
+
+type Initial = Arc<Mutex<Option<Connecting>>>;
+type PlainClient = Client<Connector, Body>;
+type SecureClient = Client<https::Connector, Body>;
+type ResponseBody = Either<Incoming, Empty<Bytes>>;
+
+pub struct Http {
+    pub enabled: bool,
+    pub timeout: Duration,
+    https: Option<https::Https>,
+}
+
+#[derive(Clone)]
+struct Connector {
+    destination: SocketAddr,
+    initial: Initial,
+    proxied: bool,
+}
+
+impl Service<Uri> for Connector {
+    type Response = TokioIo<Stream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _uri: Uri) -> Self::Future {
+        let initial = self
+            .initial
+            .lock()
+            .expect("connection lock poisoned")
+            .take();
+        let destination = self.destination;
+        let proxied = self.proxied;
+        Box::pin(async move {
+            let mut stream = match initial {
+                Some(connecting) => connecting.await?,
+                None => Stream::connect(destination).await?,
+            };
+            stream.proxied = proxied;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+struct Clients {
+    plain: [PlainClient; 2],
+    secure: Option<[(SecureClient, https::Connector); 2]>,
+}
+
+impl Http {
+    pub fn new(config: &config::Http) -> Result<Self> {
+        Ok(Self {
+            enabled: config.enabled,
+            timeout: Duration::from_millis(config.sniff_timeout_ms),
+            https: (config.enabled && config.upgrade)
+                .then(|| https::Https::new(config))
+                .transpose()?,
+        })
+    }
+
+    pub async fn serve(
+        self: Arc<Self>,
+        client: Stream,
+        destination: SocketAddr,
+        connecting: Connecting,
+    ) -> Result<()> {
+        let initial = Arc::new(Mutex::new(Some(connecting)));
+        let clients = OnceLock::new();
+        let service = service_fn(move |request: Request<Incoming>| {
+            let clients = clients.get_or_init(|| {
+                let mut builder = Client::builder(TokioExecutor::new());
+                builder.set_host(false).http1_preserve_header_case(true);
+                let secure = self.https.as_ref().map(|https| {
+                    [false, true].map(|http2| {
+                        let connector = https.connector(destination, http2);
+                        (builder.build(connector.clone()), connector)
+                    })
+                });
+                builder.http2_only(request.version() == Version::HTTP_2);
+                let plain = [false, true].map(|proxied| {
+                    builder.build(Connector {
+                        destination,
+                        initial: Arc::clone(&initial),
+                        proxied,
+                    })
+                });
+                Clients { plain, secure }
+            });
+            let proxied = request.version() != Version::HTTP_2 && request.uri().scheme().is_some();
+            let switching = request.headers().contains_key(UPGRADE);
+            let plain = clients.plain[usize::from(proxied)].clone();
+            let secure = clients
+                .secure
+                .as_ref()
+                .filter(|_| !proxied)
+                .map(|clients| clients[usize::from(!switching)].clone());
+            let http = Arc::clone(&self);
+            let initial = Arc::clone(&initial);
+
+            async move {
+                let response = match http
+                    .forward(request, destination, initial, plain, secure)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!(%destination, ?error, "HTTP request failed");
+                        let mut response = Response::new(Either::Right(Empty::<Bytes>::new()));
+                        *response.status_mut() = StatusCode::BAD_GATEWAY;
+                        response
+                    }
+                };
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let mut server = auto::Builder::new(TokioExecutor::new());
+        server
+            .http1()
+            .half_close(true)
+            .preserve_header_case(true)
+            .header_read_timeout(None);
+        server.http2().enable_connect_protocol();
+        server
+            .serve_connection_with_upgrades(TokioIo::new(client), service)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(())
+    }
+
+    async fn forward(
+        &self,
+        mut request: Request<Incoming>,
+        destination: SocketAddr,
+        initial: Initial,
+        plain: PlainClient,
+        secure: Option<(SecureClient, https::Connector)>,
+    ) -> Result<Response<ResponseBody>> {
+        let connect = request.method() == Method::CONNECT;
+        let extended = request.extensions().get::<hyper::ext::Protocol>().is_some();
+        let switching = connect || request.headers().contains_key(UPGRADE);
+        let client_upgrade = switching.then(|| upgrade::on(&mut request));
+        let mut parts = request.uri().clone().into_parts();
+        let host = match &parts.authority {
+            Some(authority) => authority.clone(),
+            None => match request
+                .headers()
+                .get(HOST)
+                .filter(|value| !value.is_empty())
+            {
+                Some(host) => host.to_str()?.parse().context("invalid HTTP host")?,
+                None => destination.to_string().parse()?,
+            },
+        };
+        parts.authority = Some(host.clone());
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some("/".parse()?);
+        }
+        if parts.scheme.is_none() {
+            parts.scheme = Some(Scheme::HTTP);
+        }
+        *request.uri_mut() = Uri::from_parts(parts)?;
+        hop_headers(request.headers_mut(), true)?;
+        let request = request.map(Body::new);
+        let mut response = if let Some((secure, mut connector)) = secure
+            && (!connect || extended)
+            && request.uri().scheme() == Some(&Scheme::HTTP)
+        {
+            let mut parts = request.uri().clone().into_parts();
+            let target = authority(&host)?;
+            parts.authority = Some(target.clone());
+            parts.scheme = Some(Scheme::HTTPS);
+            let uri = Uri::from_parts(parts)?;
+            let redirect = !switching
+                && matches!(*request.method(), Method::GET | Method::HEAD)
+                && request
+                    .headers()
+                    .get("upgrade-insecure-requests")
+                    .is_some_and(|value| value == "1");
+            if redirect {
+                if connector.available(&uri).await {
+                    initial.lock().expect("connection lock poisoned").take();
+                    let mut response = Response::new(Either::Right(Empty::new()));
+                    *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+                    response
+                        .headers_mut()
+                        .insert(LOCATION, uri.to_string().parse()?);
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    return Ok(response);
+                }
+                plain.request(request).await?
+            } else {
+                let mut encrypted = request.clone();
+                *encrypted.uri_mut() = uri.clone();
+                if encrypted.headers().contains_key(HOST) {
+                    encrypted
+                        .headers_mut()
+                        .insert(HOST, HeaderValue::from_str(target.as_str())?);
+                }
+                if !extended {
+                    *encrypted.version_mut() = Version::HTTP_11;
+                }
+                match secure.request(encrypted).await {
+                    Ok(response) => {
+                        initial.lock().expect("connection lock poisoned").take();
+                        debug!(%host, "using HTTPS upstream");
+                        response
+                    }
+                    Err(error) if error.is_connect() => {
+                        debug!(%host, ?error, "using HTTP upstream");
+                        plain.request(request).await?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else {
+            plain.request(request).await?
+        };
+
+        if (response.status() == StatusCode::SWITCHING_PROTOCOLS
+            || (connect && response.status().is_success()))
+            && let Some(client_upgrade) = client_upgrade
+        {
+            let upstream_upgrade = upgrade::on(&mut response);
+            tokio::spawn(async move {
+                let result = async {
+                    let (client, upstream) = tokio::try_join!(client_upgrade, upstream_upgrade)?;
+                    copy_bidirectional(&mut TokioIo::new(client), &mut TokioIo::new(upstream))
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    warn!(?error, "HTTP tunnel failed");
+                }
+            });
+        }
+        hop_headers(response.headers_mut(), false)?;
+        Ok(response.map(Either::Left))
+    }
+}
+
+fn authority(value: &Authority) -> Result<Authority> {
+    if value.port_u16() == Some(80) {
+        Ok(value.host().parse()?)
+    } else {
+        Ok(value.clone())
+    }
+}
+
+fn hop_headers(headers: &mut HeaderMap, request: bool) -> Result<()> {
+    let upgrade = headers.get(UPGRADE).cloned();
+    let trailers = request
+        && headers.get_all(TE).iter().any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+            })
+        });
+    let mut nominated = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        for name in value
+            .to_str()?
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            nominated.push(HeaderName::from_bytes(name.as_bytes())?);
+        }
+    }
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [CONNECTION, TE, TRANSFER_ENCODING] {
+        headers.remove(name);
+    }
+    headers.remove("keep-alive");
+    headers.remove("proxy-connection");
+    if let Some(upgrade) = upgrade {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, upgrade);
+    }
+    if trailers {
+        headers.insert(TE, HeaderValue::from_static("trailers"));
+    }
+    Ok(())
+}

@@ -24,9 +24,15 @@ pub async fn run(config: Option<&Packet>, verbose: bool) -> Result<()> {
         command.arg("--debug=1");
     }
 
-    command.args(["--filter-tcp=*", "--payload=tls_client_hello"]);
-    for action in &config.tls {
-        command.arg("--lua-desync").arg(action);
+    command.arg("--filter-tcp=*");
+    for (payload, actions) in [
+        ("http_req", &config.http),
+        ("tls_client_hello", &config.tls),
+    ] {
+        command.arg("--payload").arg(payload);
+        for action in actions {
+            command.arg("--lua-desync").arg(action);
+        }
     }
     command.args(["--new", "--filter-udp=*", "--payload=quic_initial"]);
     for action in &config.quic {

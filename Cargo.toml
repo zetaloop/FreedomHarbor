@@ -6,10 +6,18 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { version = "0.27.10", features = ["http2"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "server-auto", "http1", "http2", "tokio"] }
 libc = "0.2.190"
+moka = { version = "0.12.16", features = ["future"] }
+rustls = "0.23.45"
 serde = { version = "1.0.229", features = ["derive"] }
 socket2 = { version = "0.6.5", features = ["all"] }
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "process"] }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "process", "time", "sync"] }
 toml = "1.1.8"
+tower-service = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

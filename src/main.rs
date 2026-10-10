@@ -1,8 +1,13 @@
+mod body;
 mod config;
+mod http;
+mod https;
 mod packet;
+mod protocol;
+mod stream;
 mod tcp;
 
-use std::{io::IsTerminal, path::PathBuf};
+use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
@@ -41,9 +46,10 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
+    let http = Arc::new(http::Http::new(&config.http)?);
 
     tokio::select! {
-        result = tcp::run(&config.listen) => result,
+        result = tcp::run(&config.listen, http) => result,
         result = packet::run(config.packet.as_ref(), args.verbose) => result,
         _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),

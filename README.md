@@ -16,3 +16,5 @@ sudo ip -6 route add local default dev lo table 100
 sudo nft -f examples/freedomharbor.nft
 sudo ./target/release/freedomharbor -c examples/freedomharbor.toml
 ```
+
+`[http]` 中的 `upgrade` 控制自动 HTTPS 升级，`enabled` 控制 HTTP 解析；两项默认开启。
