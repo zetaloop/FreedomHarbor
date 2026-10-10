@@ -36,6 +36,7 @@ pub struct Http {
     pub sniff_timeout_ms: u64,
     pub tls_timeout_ms: u64,
     pub cache_ttl_ms: u64,
+    pub probe: Probe,
 }
 
 impl Default for Http {
@@ -46,8 +47,55 @@ impl Default for Http {
             sniff_timeout_ms: 10,
             tls_timeout_ms: 3_000,
             cache_ttl_ms: 300_000,
+            probe: Probe::default(),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Probe {
+    pub enabled: bool,
+    pub capture: bool,
+    pub samples: PathBuf,
+    pub rules: Vec<Rule>,
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capture: true,
+            samples: "/var/lib/freedomharbor/samples".into(),
+            rules: vec![Rule {
+                name: "usershare".into(),
+                urls: vec![r"^https?://[^/]+/usershare/(?:flash\.js|1\.swf)(?:[?#]|$)".into()],
+                elements: vec![
+                    r#"script[src*="/usershare/flash.js"], object[data*="/usershare/1.swf"], embed[src*="/usershare/1.swf"], param[name="movie"][value*="/usershare/1.swf"]"#.into(),
+                ],
+                scripts: vec![
+                    r"(?s)\bgetIPs\s*\(.*\brtcsetcookie\s*\(.*\bcheckflash\s*\(".into(),
+                    r"(?s)\bsetTimeout\s*\(.*\bsetCookie\s*\(.*\blocation\s*\.\s*replace\s*\(.*\blocation\s*\.\s*href".into(),
+                ],
+                ..Rule::default()
+            }],
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub name: String,
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub elements: Vec<String>,
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    #[serde(default)]
+    pub cookies: Vec<String>,
 }
 
 #[derive(Deserialize)]

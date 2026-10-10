@@ -1,0 +1,100 @@
+# 配置
+
+使用 `-c` 指定 TOML 文件，省略的字段采用默认值。[程序配置示例](../examples/freedomharbor.toml)与[流量规则示例](../examples/freedomharbor.nft)配套使用。修改程序配置后重新启动进程；修改 nftables 规则后通过宿主的防火墙配置应用。
+
+`-v` 输出连接调试日志，并启用 nfqws2 的调试输出。
+
+## 监听
+
+顶层 `listen` 是透明 TCP 监听地址列表，默认为 `["127.0.0.1:15000", "[::1]:15000"]`。其端口与 nftables 示例中的 `port` 对应。
+
+## HTTP
+
+在 `[http]` 中设置：
+
+| 字段 | 默认值 | 作用 |
+|---|---|---|
+| `enabled` | `true` | 启用 HTTP 识别与请求响应处理；关闭后使用普通 TCP 转发 |
+| `upgrade` | `true` | 自动尝试 HTTPS 上游；关闭后沿原 HTTP 方式发送请求 |
+| `sniff_timeout_ms` | `10` | 模糊协议前缀的缓冲时间；到期后开始转发并继续识别 |
+| `tls_timeout_ms` | `3000` | HTTPS 上游建立连接的超时时间 |
+| `cache_ttl_ms` | `300000` | HTTPS 可用性结果的缓存时间 |
+
+时间字段的单位为毫秒。HTTPS 上游连接建立失败时使用 HTTP；携带 `Upgrade-Insecure-Requests: 1` 的普通 GET／HEAD 请求可在 HTTPS 可用时收到 307 重定向。
+
+## 主动探针
+
+在 `[http.probe]` 中设置：
+
+| 字段 | 默认值 | 作用 |
+|---|---|---|
+| `enabled` | `true` | 启用探针内容规则，需要同时启用 HTTP 处理 |
+| `capture` | `true` | 保存命中留样；关闭后继续执行过滤和记录命中日志 |
+| `samples` | `/var/lib/freedomharbor/samples` | 样本存放目录，进程需要写入权限 |
+| `rules` | 内置 `usershare` 规则 | 通过 `[[http.probe.rules]]` 提供的列表替换内置规则 |
+
+每条规则的字段如下：
+
+| 字段 | 作用 |
+|---|---|
+| `name` | 日志和样本中的规则名称 |
+| `scope` | 当前请求 URL 的正则；省略时适用于所有请求 |
+| `urls` | 阻断的资源 URL 正则列表，也匹配响应中的重定向目标 |
+| `elements` | 移除 HTML 元素的 CSS 选择器列表 |
+| `scripts` | 清除内联 `script` 内容的正则列表 |
+| `cookies` | Cookie 名称正则列表，清除请求 Cookie 与响应 Set-Cookie 中的匹配项 |
+
+`name` 为必填项，其余列表默认为空。符合 `scope` 的规则共同生效。匹配的资源请求与重定向返回 204；元素规则移除对应节点及内容，脚本规则清除没有 `src` 属性的匹配内联脚本文本。
+
+### 留样
+
+开启 `capture` 后，待检查的 HTML 正文会随接收过程写入临时文件，命中后保存为样本。每份样本使用一个目录：
+
+| 文件 | 内容 |
+|---|---|
+| `request.headers` | 关联请求的方法、URL、协议版本与处理前的请求头 |
+| `response.headers` | 处理前的响应状态与响应头 |
+| `response.body` | 保留原内容编码的响应正文 |
+| `request.body` | 被阻断资源请求的正文 |
+| `trailers.headers` | 收到的尾部字段 |
+| `event.json` | 来源、目标、命中规则及接收结果 |
+
+文件随实际收到的内容生成。`event.json` 中的 `complete` 表示正文是否接收完整，`error` 记录中断或处理异常。
+
+## 报文策略
+
+添加 `[packet]` 后，程序启动并管理 `nfqws2`。该配置与 nftables 中的队列规则配套启用；省略 `[packet]` 时使用仅导入 TCP 的规则。
+
+| 字段 | 默认值 | 作用 |
+|---|---|---|
+| `queue` | `200` | NFQUEUE 编号，与 nftables 的 `qnum` 对应 |
+| `lua` | `/usr/share/zapret2/lua` | 包含 `zapret-lib.lua` 和 `zapret-antidpi.lua` 的目录 |
+| `http` | `["multidisorder:pos=2,midsld"]` | HTTP 请求报文的 Lua 策略 |
+| `tls` | `["multidisorder:pos=2,midsld"]` | TLS ClientHello 的 Lua 策略 |
+| `quic` | `["fake:blob=fake_default_quic"]` | QUIC Initial 的 Lua 策略 |
+
+策略按列表顺序传给 nfqws2，空列表停用相应的策略动作。动作名称与参数使用 [nfqws2 的 Lua 接口](https://github.com/bol-van/zapret2/blob/master/docs/manual.en.md)。
+
+## 流量规则
+
+`examples/freedomharbor.nft` 中的变量控制流量导入和报头处理：
+
+| 变量 | 示例值 | 作用 |
+|---|---|---|
+| `lan` | `lan0` | LAN 入站接口 |
+| `wan` | `wan0` | WAN 出站接口 |
+| `port` | `15000` | 透明 TCP 投递端口，对应程序的 `listen` |
+| `qnum` | `200` | 报文队列编号，对应 `packet.queue` |
+| `hops` | `64` | LAN→WAN 转发报文的 TTL／Hop Limit |
+| `intercept` | `0x1` | 透明投递标记，与策略路由的 `fwmark` 对应 |
+| `datagram` | `0x20000000` | UDP 报文路径标记 |
+| `generated` | `0x40000000` | nfqws2 的生成报文标记 |
+
+示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。标记值与宿主的其他流量规则统一分配，`generated` 与 nfqws2 使用的值一致。
+
+`freedomharbor_headers` 表负责转发报文的跳数、IPv4 IPID 和 IPv6 Flow Label。使用以下命令关闭或开启该表：
+
+```sh
+sudo nft 'add table inet freedomharbor_headers { flags dormant; }'
+sudo nft add table inet freedomharbor_headers
+```

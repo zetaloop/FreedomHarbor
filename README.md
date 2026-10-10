@@ -2,11 +2,28 @@
 
 Linux 双栈透明流量处理工具。
 
+## 准备
+
+运行需要 Linux、nftables、iproute2、系统 CA 证书，以及 [nfqws2](https://github.com/bol-van/zapret2) 和配套 Lua 库。源码构建使用 Rust 与 C 编译工具链。
+
+宿主负责 LAN／WAN 接口、地址、路由和转发设置，防火墙允许导入的 TCP 流量。
+
+## 构建
+
 ```sh
 cargo build --release
 ```
 
-安装 `nfqws2`，在 TOML 中设置其 Lua 库目录。在 `examples/freedomharbor.nft` 中填写 LAN、WAN 接口，转发端口与队列编号对应 TOML 配置。示例使用标记 `0x1`、`0x20000000`、`0x40000000` 和路由表 `100`，宿主防火墙需要允许导入的 TCP 流量。
+## 配置
+
+- [程序配置示例](examples/freedomharbor.toml)：设置监听地址和 nfqws2 的 Lua 库目录。
+- [流量规则示例](examples/freedomharbor.nft)：填写实际的 LAN／WAN 接口，与程序配置对应。
+
+各项参数、开关和规则的作用见[配置说明](docs/configuration.md)。
+
+## 启动
+
+加载示例所需的策略路由与 nftables 规则，再启动程序：
 
 ```sh
 sudo ip rule add fwmark 0x1 lookup 100
@@ -16,14 +33,3 @@ sudo ip -6 route add local default dev lo table 100
 sudo nft -f examples/freedomharbor.nft
 sudo ./target/release/freedomharbor -c examples/freedomharbor.toml
 ```
-
-`[http]` 中的 `upgrade` 控制自动 HTTPS 升级，`enabled` 控制 HTTP 解析；两项默认开启。
-
-外发报头规则位于 `freedomharbor_headers` 表，跳数由 `hops` 指定。
-
-```sh
-sudo nft 'add table inet freedomharbor_headers { flags dormant; }'
-sudo nft add table inet freedomharbor_headers
-```
-
-上述命令分别关闭和开启报头处理。

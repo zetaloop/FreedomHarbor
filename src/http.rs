@@ -15,12 +15,8 @@ use http::{
     header::{CACHE_CONTROL, CONNECTION, HOST, LOCATION, TE, TRANSFER_ENCODING, UPGRADE},
     uri::{Authority, Scheme},
 };
-use http_body_util::{Either, Empty};
-use hyper::{
-    body::{Bytes, Incoming},
-    service::service_fn,
-    upgrade,
-};
+use http_body_util::BodyExt;
+use hyper::{body::Incoming, service::service_fn, upgrade};
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
@@ -30,19 +26,24 @@ use tokio::io::copy_bidirectional;
 use tower_service::Service;
 use tracing::{debug, warn};
 
-use crate::{body::Body, config, https, stream::Stream};
+use crate::{
+    body::{self, Body, ResponseBody},
+    config, https,
+    probe::Probe,
+    stream::Stream,
+};
 
 pub type Connecting = Pin<Box<dyn Future<Output = io::Result<Stream>> + Send>>;
 
 type Initial = Arc<Mutex<Option<Connecting>>>;
 type PlainClient = Client<Connector, Body>;
 type SecureClient = Client<https::Connector, Body>;
-type ResponseBody = Either<Incoming, Empty<Bytes>>;
 
 pub struct Http {
     pub enabled: bool,
     pub timeout: Duration,
     https: Option<https::Https>,
+    probe: Option<Probe>,
 }
 
 #[derive(Clone)]
@@ -93,6 +94,9 @@ impl Http {
             https: (config.enabled && config.upgrade)
                 .then(|| https::Https::new(config))
                 .transpose()?,
+            probe: (config.enabled && config.probe.enabled)
+                .then(|| Probe::new(&config.probe))
+                .transpose()?,
         })
     }
 
@@ -102,6 +106,7 @@ impl Http {
         destination: SocketAddr,
         connecting: Connecting,
     ) -> Result<()> {
+        let source = client.socket.peer_addr()?;
         let initial = Arc::new(Mutex::new(Some(connecting)));
         let clients = OnceLock::new();
         let service = service_fn(move |request: Request<Incoming>| {
@@ -137,13 +142,13 @@ impl Http {
 
             async move {
                 let response = match http
-                    .forward(request, destination, initial, plain, secure)
+                    .forward(request, source, destination, initial, plain, secure)
                     .await
                 {
                     Ok(response) => response,
                     Err(error) => {
                         warn!(%destination, ?error, "HTTP request failed");
-                        let mut response = Response::new(Either::Right(Empty::<Bytes>::new()));
+                        let mut response = Response::new(body::empty());
                         *response.status_mut() = StatusCode::BAD_GATEWAY;
                         response
                     }
@@ -168,6 +173,7 @@ impl Http {
     async fn forward(
         &self,
         mut request: Request<Incoming>,
+        source: SocketAddr,
         destination: SocketAddr,
         initial: Initial,
         plain: PlainClient,
@@ -197,6 +203,20 @@ impl Http {
             parts.scheme = Some(Scheme::HTTP);
         }
         *request.uri_mut() = Uri::from_parts(parts)?;
+        let exchange = self
+            .probe
+            .as_ref()
+            .map(|probe| probe.request(&mut request, source, destination));
+        if let Some(exchange) = exchange.as_ref()
+            && exchange.blocked
+        {
+            return Ok(self
+                .probe
+                .as_ref()
+                .expect("probe enabled")
+                .block(request.into_body(), exchange)
+                .await);
+        }
         hop_headers(request.headers_mut(), true)?;
         let request = request.map(Body::new);
         let mut response = if let Some((secure, mut connector)) = secure
@@ -217,7 +237,7 @@ impl Http {
             if redirect {
                 if connector.available(&uri).await {
                     initial.lock().expect("connection lock poisoned").take();
-                    let mut response = Response::new(Either::Right(Empty::new()));
+                    let mut response = Response::new(body::empty());
                     *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
                     response
                         .headers_mut()
@@ -274,8 +294,12 @@ impl Http {
                 }
             });
         }
+        let mut response = match (&self.probe, exchange) {
+            (Some(probe), Some(exchange)) => probe.response(response, exchange).await?,
+            _ => response.map(|body| body.map_err(anyhow::Error::from).boxed_unsync()),
+        };
         hop_headers(response.headers_mut(), false)?;
-        Ok(response.map(Either::Left))
+        Ok(response)
     }
 }
 

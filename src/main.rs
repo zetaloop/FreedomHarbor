@@ -1,9 +1,12 @@
 mod body;
 mod config;
+mod html;
 mod http;
 mod https;
 mod packet;
+mod probe;
 mod protocol;
+mod sample;
 mod stream;
 mod tcp;
 

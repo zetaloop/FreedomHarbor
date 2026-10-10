@@ -4,7 +4,16 @@ use std::{
     task::{Context, Poll},
 };
 
+use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
+
+pub type ResponseBody = UnsyncBoxBody<Bytes, anyhow::Error>;
+
+pub fn empty() -> ResponseBody {
+    Empty::<Bytes>::new()
+        .map_err(anyhow::Error::from)
+        .boxed_unsync()
+}
 
 #[derive(Clone)]
 pub struct Body(Arc<Mutex<Incoming>>);
