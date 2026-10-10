@@ -5,6 +5,7 @@ define intercept = 0x1
 define datagram = 0x20000000
 define generated = 0x40000000
 define qnum = 200
+define hops = 64
 
 table inet freedomharbor {
     chain prerouting {
@@ -41,5 +42,23 @@ table inet freedomharbor {
 
         iifname $wan ct direction reply meta l4proto tcp tcp flags & (syn | fin | rst) != 0 queue num $qnum
         iifname $wan ct direction reply meta l4proto udp @th,64,8 & 0x80 != 0 meta mark set meta mark | $datagram queue num $qnum
+    }
+}
+
+table inet freedomharbor_headers {
+    chain forward {
+        type filter hook forward priority mangle; policy accept;
+
+        iifname $lan oifname $wan fib daddr type unicast jump normalize
+    }
+
+    chain normalize {
+        ip ttl set $hops
+        ip6 hoplimit set $hops
+
+        # Fragment association and AH authentication use the IPv4 identification.
+        ip protocol != ah ip frag-off & 0x7fff == 0x4000 ip id set 0
+        # The IPv6 write validator accepts the complete first word.
+        meta nfproto ipv6 @nh,0,32 set (@nh,0,32 & 0xfff00000) | (ct id & 0x000fffff)
     }
 }

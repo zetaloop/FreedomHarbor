@@ -18,3 +18,12 @@ sudo ./target/release/freedomharbor -c examples/freedomharbor.toml
 ```
 
 `[http]` 中的 `upgrade` 控制自动 HTTPS 升级，`enabled` 控制 HTTP 解析；两项默认开启。
+
+外发报头规则位于 `freedomharbor_headers` 表，跳数由 `hops` 指定。
+
+```sh
+sudo nft 'add table inet freedomharbor_headers { flags dormant; }'
+sudo nft add table inet freedomharbor_headers
+```
+
+上述命令分别关闭和开启报头处理。
