@@ -12,7 +12,9 @@ use std::{
 use anyhow::{Context as _, Result};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
-    header::{CACHE_CONTROL, CONNECTION, HOST, LOCATION, TE, TRANSFER_ENCODING, UPGRADE},
+    header::{
+        CACHE_CONTROL, CONNECTION, HOST, LOCATION, TE, TRANSFER_ENCODING, UPGRADE, USER_AGENT,
+    },
     uri::{Authority, Scheme},
 };
 use http_body_util::BodyExt;
@@ -44,6 +46,7 @@ pub struct Http {
     pub timeout: Duration,
     https: Option<https::Https>,
     probe: Option<Probe>,
+    user_agent: Option<HeaderValue>,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,11 @@ impl Http {
             probe: (config.enabled && config.probe.enabled)
                 .then(|| Probe::new(&config.probe))
                 .transpose()?,
+            user_agent: (config.enabled && config.normalize)
+                .then(|| {
+                    HeaderValue::from_str(&config.user_agent).context("invalid http.user_agent")
+                })
+                .transpose()?,
         })
     }
 
@@ -109,6 +117,7 @@ impl Http {
         let source = client.socket.peer_addr()?;
         let initial = Arc::new(Mutex::new(Some(connecting)));
         let clients = OnceLock::new();
+        let preserve_case = self.user_agent.is_none();
         let service = service_fn(move |request: Request<Incoming>| {
             let clients = clients.get_or_init(|| {
                 let mut builder = Client::builder(TokioExecutor::new());
@@ -160,7 +169,7 @@ impl Http {
         server
             .http1()
             .half_close(true)
-            .preserve_header_case(true)
+            .preserve_header_case(preserve_case)
             .header_read_timeout(None);
         server.http2().enable_connect_protocol();
         server
@@ -219,7 +228,13 @@ impl Http {
         }
         hop_headers(request.headers_mut(), true)?;
         let request = request.map(Body::new);
-        let mut response = if let Some((secure, mut connector)) = secure
+        let send = async |mut request: Request<Body>| {
+            if let Some(user_agent) = &self.user_agent {
+                normalize(request.headers_mut(), user_agent);
+            }
+            plain.request(request).await
+        };
+        let (mut response, encrypted) = if let Some((secure, mut connector)) = secure
             && (!connect || extended)
             && request.uri().scheme() == Some(&Scheme::HTTP)
         {
@@ -247,7 +262,7 @@ impl Http {
                         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
                     return Ok(response);
                 }
-                plain.request(request).await?
+                (send(request).await?, false)
             } else {
                 let mut encrypted = request.clone();
                 *encrypted.uri_mut() = uri.clone();
@@ -263,17 +278,17 @@ impl Http {
                     Ok(response) => {
                         initial.lock().expect("connection lock poisoned").take();
                         debug!(%host, "using HTTPS upstream");
-                        response
+                        (response, true)
                     }
                     Err(error) if error.is_connect() => {
                         debug!(%host, ?error, "using HTTP upstream");
-                        plain.request(request).await?
+                        (send(request).await?, false)
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
         } else {
-            plain.request(request).await?
+            (send(request).await?, false)
         };
 
         if (response.status() == StatusCode::SWITCHING_PROTOCOLS
@@ -299,6 +314,10 @@ impl Http {
             _ => response.map(|body| body.map_err(anyhow::Error::from).boxed_unsync()),
         };
         hop_headers(response.headers_mut(), false)?;
+        if !encrypted && self.user_agent.is_some() {
+            response.headers_mut().remove("accept-ch");
+            response.headers_mut().remove("critical-ch");
+        }
         Ok(response)
     }
 }
@@ -309,6 +328,38 @@ fn authority(value: &Authority) -> Result<Authority> {
     } else {
         Ok(value.clone())
     }
+}
+
+fn normalize(headers: &mut HeaderMap, user_agent: &HeaderValue) {
+    headers.insert(USER_AGENT, user_agent.clone());
+    let mut fields: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| {
+            !name.as_str().starts_with("sec-ch-")
+                && !matches!(
+                    name.as_str(),
+                    "forwarded"
+                        | "via"
+                        | "x-forwarded-for"
+                        | "x-real-ip"
+                        | "device-memory"
+                        | "dpr"
+                        | "width"
+                        | "viewport-width"
+                        | "rtt"
+                        | "downlink"
+                        | "ect"
+                        | "save-data"
+                )
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    let mut normalized = HeaderMap::with_capacity(fields.len());
+    for (name, value) in fields {
+        normalized.append(name, value);
+    }
+    *headers = normalized;
 }
 
 fn hop_headers(headers: &mut HeaderMap, request: bool) -> Result<()> {

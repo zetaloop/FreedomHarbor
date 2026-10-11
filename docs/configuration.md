@@ -16,11 +16,15 @@
 |---|---|---|
 | `enabled` | `true` | 启用 HTTP 识别与请求响应处理；关闭后使用普通 TCP 转发 |
 | `upgrade` | `true` | 自动尝试 HTTPS 上游；关闭后沿原 HTTP 方式发送请求 |
+| `normalize` | `true` | 规范化明文出站请求的设备身份、来源信息与字段形式 |
+| `user_agent` | 随包提供的 Chrome 桌面 UA | 规范化使用的统一 User-Agent |
 | `sniff_timeout_ms` | `10` | 模糊协议前缀的缓冲时间；到期后开始转发并继续识别 |
 | `tls_timeout_ms` | `3000` | HTTPS 上游建立连接的超时时间 |
 | `cache_ttl_ms` | `300000` | HTTPS 可用性结果的缓存时间 |
 
 时间字段的单位为毫秒。HTTPS 上游连接建立失败时使用 HTTP；携带 `Upgrade-Insecure-Requests: 1` 的普通 GET／HEAD 请求可在 HTTPS 可用时收到 307 重定向。
+
+内置 UA 采用安卓 Chrome 桌面模式的格式。明文规范化会清除 Client Hints 与来源链信息；HTTPS 上游使用原业务字段。
 
 ## 主动探针
 

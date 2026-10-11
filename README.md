@@ -14,6 +14,8 @@ Linux 双栈透明流量处理工具。
 cargo build --release
 ```
 
+发布前运行 `py scripts/user-agent.py`，从 Chrome 官方稳定版数据更新内置 UA。
+
 ## 配置
 
 - [程序配置示例](examples/freedomharbor.toml)：设置监听地址和 nfqws2 的 Lua 库目录。

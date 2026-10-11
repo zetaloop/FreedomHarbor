@@ -33,6 +33,8 @@ impl Default for Config {
 pub struct Http {
     pub enabled: bool,
     pub upgrade: bool,
+    pub normalize: bool,
+    pub user_agent: String,
     pub sniff_timeout_ms: u64,
     pub tls_timeout_ms: u64,
     pub cache_ttl_ms: u64,
@@ -44,6 +46,8 @@ impl Default for Http {
         Self {
             enabled: true,
             upgrade: true,
+            normalize: true,
+            user_agent: include_str!("user-agent.txt").trim().into(),
             sniff_timeout_ms: 10,
             tls_timeout_ms: 3_000,
             cache_ttl_ms: 300_000,
