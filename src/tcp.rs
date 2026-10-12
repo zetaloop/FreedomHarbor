@@ -1,11 +1,21 @@
-use std::{future::pending, io, net::SocketAddr, sync::Arc};
+use std::{
+    future::pending,
+    io,
+    net::SocketAddr,
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    ptr,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use hyper::body::Bytes;
 use socket2::{Domain, Socket, Type};
 use tokio::{
-    io::{AsyncReadExt, Interest, Ready, copy_bidirectional},
-    net::{TcpListener, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt, Interest, Ready},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{ReadHalf, WriteHalf},
+    },
     task::JoinSet,
     time::{Instant, sleep_until},
 };
@@ -149,9 +159,20 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
             Some(stream) => stream,
             None => connecting.await?,
         };
-        client.prefix = Bytes::from(request).slice(sent..);
-        upstream.prefix = Bytes::from(response).slice(received..);
-        let (forwarded, returned) = copy_bidirectional(&mut client, &mut upstream).await?;
+        let (client_read, client_write) = client.socket.split();
+        let (upstream_read, upstream_write) = upstream.socket.split();
+        let (forwarded, returned) = tokio::try_join!(
+            transfer(
+                client_read,
+                upstream_write,
+                Bytes::from(request).slice(sent..),
+            ),
+            transfer(
+                upstream_read,
+                client_write,
+                Bytes::from(response).slice(received..),
+            ),
+        )?;
         debug!(
             %destination,
             sent = forwarded + sent as u64,
@@ -190,6 +211,71 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
         connecting
     };
     http.serve(client, destination, initial).await
+}
+
+async fn transfer(
+    reader: ReadHalf<'_>,
+    mut writer: WriteHalf<'_>,
+    prefix: Bytes,
+) -> io::Result<u64> {
+    let mut total = prefix.len() as u64;
+    writer.write_all(&prefix).await?;
+    drop(prefix);
+
+    let source = reader.as_ref();
+    if source.peek(&mut [0]).await? == 0 {
+        writer.shutdown().await?;
+        return Ok(total);
+    }
+
+    let (pipe_read, pipe_write) = io::pipe()?;
+    loop {
+        let mut pending = source
+            .async_io(Interest::READABLE, || {
+                splice(source.as_fd(), pipe_write.as_fd(), isize::MAX as usize)
+            })
+            .await?;
+        if pending == 0 {
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+
+        let destination = writer.as_ref();
+        while pending != 0 {
+            let count = destination
+                .async_io(Interest::WRITABLE, || {
+                    splice(pipe_read.as_fd(), destination.as_fd(), pending)
+                })
+                .await?;
+            if count == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            pending -= count;
+            total += count as u64;
+        }
+    }
+}
+
+fn splice(source: BorrowedFd<'_>, destination: BorrowedFd<'_>, length: usize) -> io::Result<usize> {
+    loop {
+        let count = unsafe {
+            libc::splice(
+                source.as_raw_fd(),
+                ptr::null_mut(),
+                destination.as_raw_fd(),
+                ptr::null_mut(),
+                length,
+                libc::SPLICE_F_NONBLOCK,
+            )
+        };
+        if count >= 0 {
+            return Ok(count as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 async fn ready(stream: Option<&Stream>, read: bool, write: bool) -> io::Result<Ready> {
