@@ -11,6 +11,8 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub listen: Vec<SocketAddr>,
+    pub tls: bool,
+    pub sniff_timeout_ms: u64,
     pub http: Http,
     pub packet: Option<Packet>,
 }
@@ -22,6 +24,8 @@ impl Default for Config {
                 (Ipv4Addr::LOCALHOST, 15000).into(),
                 (Ipv6Addr::LOCALHOST, 15000).into(),
             ],
+            tls: true,
+            sniff_timeout_ms: 10,
             http: Http::default(),
             packet: None,
         }
@@ -35,7 +39,6 @@ pub struct Http {
     pub upgrade: bool,
     pub normalize: bool,
     pub user_agent: String,
-    pub sniff_timeout_ms: u64,
     pub tls_timeout_ms: u64,
     pub cache_ttl_ms: u64,
     pub probe: Probe,
@@ -48,7 +51,6 @@ impl Default for Http {
             upgrade: true,
             normalize: true,
             user_agent: include_str!("user-agent.txt").trim().into(),
-            sniff_timeout_ms: 10,
             tls_timeout_ms: 3_000,
             cache_ttl_ms: 300_000,
             probe: Probe::default(),

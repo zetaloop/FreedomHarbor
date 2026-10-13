@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
-    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -43,7 +42,6 @@ type SecureClient = Client<https::Connector, Body>;
 
 pub struct Http {
     pub enabled: bool,
-    pub timeout: Duration,
     https: Option<https::Https>,
     probe: Option<Probe>,
     user_agent: Option<HeaderValue>,
@@ -93,7 +91,6 @@ impl Http {
     pub fn new(config: &config::Http) -> Result<Self> {
         Ok(Self {
             enabled: config.enabled,
-            timeout: Duration::from_millis(config.sniff_timeout_ms),
             https: (config.enabled && config.upgrade)
                 .then(|| https::Https::new(config))
                 .transpose()?,

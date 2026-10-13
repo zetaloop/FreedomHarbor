@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let http = Arc::new(http::Http::new(&config.http)?);
 
     tokio::select! {
-        result = tcp::run(&config.listen, http) => result,
+        result = tcp::run(&config, http) => result,
         result = packet::run(config.packet.as_ref(), args.verbose) => result,
         _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),

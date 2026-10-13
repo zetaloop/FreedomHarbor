@@ -1,13 +1,14 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Protocol {
     Http,
+    Tls,
     Tcp,
 }
 
-#[derive(Default)]
 pub enum Probe {
-    #[default]
-    Start,
+    Start { http: bool, tls: bool },
+    Space,
+    Tls(usize),
     Method(Option<usize>),
     Target(bool),
     Scheme,
@@ -17,15 +18,39 @@ pub enum Probe {
 }
 
 impl Probe {
+    pub fn new(http: bool, tls: bool) -> Self {
+        Self::Start { http, tls }
+    }
+
     pub fn candidate(&self) -> bool {
-        matches!(self, Self::Resource | Self::Version(_))
+        matches!(self, Self::Resource | Self::Version(_) | Self::Tls(3..))
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Option<Protocol> {
         for &byte in data {
             *self = match *self {
-                Self::Start if byte.is_ascii_whitespace() => Self::Start,
-                Self::Start if token(byte) => Self::Method((byte == b'C').then_some(1)),
+                Self::Start { tls: true, .. } if byte == 0x16 => Self::Tls(1),
+                Self::Start { http: true, .. } | Self::Space if byte.is_ascii_whitespace() => {
+                    Self::Space
+                }
+                Self::Start { http: true, .. } | Self::Space if token(byte) => {
+                    Self::Method((byte == b'C').then_some(1))
+                }
+                Self::Tls(position)
+                    if match position {
+                        1 | 9 => byte == 3,
+                        2 | 10 => byte <= 3,
+                        3 | 4 | 6..=8 => true,
+                        5 => byte == 1,
+                        _ => false,
+                    } =>
+                {
+                    if position == 10 {
+                        Self::Done(Protocol::Tls)
+                    } else {
+                        Self::Tls(position + 1)
+                    }
+                }
                 Self::Method(position) if byte == b' ' || byte == b'\t' => {
                     Self::Target(position == Some(b"CONNECT".len()))
                 }

@@ -23,15 +23,17 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    config::Config,
     http::{Connecting, Http},
     protocol::{self, Probe, Protocol},
     stream::Stream,
 };
 
-pub async fn run(addresses: &[SocketAddr], http: Arc<Http>) -> Result<()> {
+pub async fn run(config: &Config, http: Arc<Http>) -> Result<()> {
     let mut listeners = JoinSet::new();
+    let timeout = Duration::from_millis(config.sniff_timeout_ms);
 
-    for &address in addresses {
+    for &address in &config.listen {
         let socket = Socket::new(Domain::for_address(address), Type::STREAM, None)?;
         socket.set_reuse_address(true)?;
         socket.set_nonblocking(true)?;
@@ -48,7 +50,7 @@ pub async fn run(addresses: &[SocketAddr], http: Arc<Http>) -> Result<()> {
         socket.listen(libc::SOMAXCONN)?;
         let listener = TcpListener::from_std(socket.into())?;
         info!(%address, "listening");
-        listeners.spawn(accept(listener, Arc::clone(&http)));
+        listeners.spawn(accept(listener, Arc::clone(&http), config.tls, timeout));
     }
 
     while let Some(result) = listeners.join_next().await {
@@ -57,7 +59,7 @@ pub async fn run(addresses: &[SocketAddr], http: Arc<Http>) -> Result<()> {
     pending().await
 }
 
-async fn accept(listener: TcpListener, http: Arc<Http>) {
+async fn accept(listener: TcpListener, http: Arc<Http>, tls: bool, timeout: Duration) {
     loop {
         let (client, source) = match listener.accept().await {
             Ok(connection) => connection,
@@ -89,14 +91,20 @@ async fn accept(listener: TcpListener, http: Arc<Http>) {
         let http = Arc::clone(&http);
 
         tokio::spawn(async move {
-            if let Err(error) = forward(client, destination, http).await {
+            if let Err(error) = forward(client, destination, http, tls, timeout).await {
                 warn!(%source, %destination, ?error, "connection failed");
             }
         });
     }
 }
 
-async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) -> Result<()> {
+async fn forward(
+    client: TcpStream,
+    destination: SocketAddr,
+    http: Arc<Http>,
+    tls: bool,
+    timeout: Duration,
+) -> Result<()> {
     let mut client = Stream::new(client)?;
     let mut connecting: Connecting = Box::pin(Stream::connect(destination));
     let mut upstream = None;
@@ -104,10 +112,10 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
     let mut response = Vec::new();
     let mut sent = 0;
     let mut received = 0;
-    let mut probe = Probe::default();
+    let mut probe = Probe::new(http.enabled, tls);
     let mut deadline = None;
     let mut released = false;
-    let mut decision = (!http.enabled).then_some(Protocol::Tcp);
+    let mut decision = (!http.enabled && !tls).then_some(Protocol::Tcp);
     let mut buffer = [0; 8192];
 
     while decision.is_none() {
@@ -127,7 +135,7 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
                     match client.socket.try_read(&mut buffer) {
                         Ok(0) => decision = Some(Protocol::Tcp),
                         Ok(count) => {
-                            deadline.get_or_insert_with(|| Instant::now() + http.timeout);
+                            deadline.get_or_insert_with(|| Instant::now() + timeout);
                             request.extend_from_slice(&buffer[..count]);
                             decision = probe.feed(&buffer[..count]);
                         }
@@ -155,9 +163,13 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
                     match stream.socket.try_read(&mut buffer) {
                         Ok(0) => decision = Some(Protocol::Tcp),
                         Ok(count) => {
-                            deadline.get_or_insert_with(|| Instant::now() + http.timeout);
+                            deadline.get_or_insert_with(|| Instant::now() + timeout);
                             response.extend_from_slice(&buffer[..count]);
-                            decision = protocol::response(&response);
+                            decision = if http.enabled {
+                                protocol::response(&response)
+                            } else {
+                                Some(Protocol::Tcp)
+                            };
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                         Err(error) => return Err(error.into()),
@@ -181,7 +193,19 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
         }
     }
 
-    if decision == Some(Protocol::Tcp) {
+    if decision == Some(Protocol::Tls) {
+        debug!(%destination, "TLS detected");
+        let length = u16::from_be_bytes([request[3], request[4]]);
+        if length > 6 {
+            // The handshake header and legacy version form the first record.
+            let mut record = [request[0], request[1], request[2], 0, 0];
+            record[3..].copy_from_slice(&(length - 6).to_be_bytes());
+            request[3..5].copy_from_slice(&6_u16.to_be_bytes());
+            request.splice(11..11, record);
+        }
+    }
+
+    if decision != Some(Protocol::Http) {
         let mut upstream = match upstream {
             Some(stream) => stream,
             None => connecting.await?,

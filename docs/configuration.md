@@ -4,9 +4,11 @@
 
 `-v` 输出连接调试日志，并启用 nfqws2 的调试输出。
 
-## 监听
+## TCP
 
 顶层 `listen` 是透明 TCP 监听地址列表，默认为 `["127.0.0.1:15000", "[::1]:15000"]`。其端口与 nftables 示例中的 `port` 对应。
+
+顶层 `tls` 默认为 `true`，将连接开头的 ClientHello 分为多条 TLS 记录。`sniff_timeout_ms` 默认为 `10`，控制模糊协议前缀的缓冲时间；到期后开始转发并继续识别。
 
 ## HTTP
 
@@ -14,11 +16,10 @@
 
 | 字段 | 默认值 | 作用 |
 |---|---|---|
-| `enabled` | `true` | 启用 HTTP 识别与请求响应处理；关闭后使用普通 TCP 转发 |
+| `enabled` | `true` | 启用 HTTP 识别与请求响应处理 |
 | `upgrade` | `true` | 自动尝试 HTTPS 上游；关闭后沿原 HTTP 方式发送请求 |
 | `normalize` | `true` | 规范化明文出站请求的设备身份、来源信息与字段形式 |
 | `user_agent` | 随包提供的 Chrome 桌面 UA | 规范化使用的统一 User-Agent |
-| `sniff_timeout_ms` | `10` | 模糊协议前缀的缓冲时间；到期后开始转发并继续识别 |
 | `tls_timeout_ms` | `3000` | HTTPS 上游建立连接的超时时间 |
 | `cache_ttl_ms` | `300000` | HTTPS 可用性结果的缓存时间 |
 
