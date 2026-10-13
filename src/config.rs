@@ -111,7 +111,6 @@ pub struct Rule {
 #[serde(default, deny_unknown_fields)]
 pub struct Packet {
     pub queue: u16,
-    pub lua: PathBuf,
     pub http: bool,
     pub tls: bool,
     pub quic: bool,
@@ -121,7 +120,6 @@ impl Default for Packet {
     fn default() -> Self {
         Self {
             queue: 200,
-            lua: "/usr/share/zapret2/lua".into(),
             http: true,
             tls: true,
             quic: true,

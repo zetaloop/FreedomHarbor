@@ -1,4 +1,3 @@
 listen = ["127.0.0.1:15000", "[::1]:15000"]
 
 [packet]
-lua = "/usr/share/zapret2/lua"

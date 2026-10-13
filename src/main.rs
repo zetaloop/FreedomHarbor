@@ -3,9 +3,11 @@ mod config;
 mod html;
 mod http;
 mod https;
+mod netfilter;
 mod packet;
 mod probe;
 mod protocol;
+mod quic;
 mod sample;
 mod stream;
 mod tcp;
@@ -53,7 +55,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         result = tcp::run(&config, http) => result,
-        result = packet::run(config.packet.as_ref(), args.verbose) => result,
+        result = packet::run(config.packet.as_ref()) => result,
         _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
     }

@@ -2,7 +2,7 @@
 
 使用 `-c` 指定 TOML 文件，省略的字段采用默认值。[程序配置示例](../examples/freedomharbor.toml)与[流量规则示例](../examples/freedomharbor.nft)配套使用。修改程序配置后重新启动进程；修改 nftables 规则后通过宿主的防火墙配置应用。
 
-`-v` 输出连接调试日志，并启用 nfqws2 的调试输出。
+`-v` 输出连接与报文处理的调试日志。
 
 ## TCP
 
@@ -68,17 +68,16 @@
 
 ## 报文策略
 
-添加 `[packet]` 后，程序启动并管理 `nfqws2`。该配置与 nftables 中的队列规则配套启用或停用。
+添加 `[packet]` 后启用报文处理。该配置与 nftables 中的队列规则配套启用或停用。
 
 | 字段 | 默认值 | 作用 |
 |---|---|---|
 | `queue` | `200` | NFQUEUE 编号，与 nftables 的 `qnum` 对应 |
-| `lua` | `/usr/share/zapret2/lua` | 包含 `zapret-lib.lua` 和 `zapret-antidpi.lua` 的目录 |
 | `http` | `true` | HTTP 请求报文的分段与倒序发送 |
 | `tls` | `true` | TLS ClientHello 报文的分段与倒序发送 |
 | `quic` | `true` | QUIC Initial 的 CRYPTO 帧重封装 |
 
-内置 `quic` 策略重排 Initial 中的 CRYPTO 帧，并使用原有填充空间重新封装。服务器按帧偏移还原握手数据。
+QUIC 处理重排 Initial 中的 CRYPTO 帧，并使用原有填充空间重新封装。服务器按帧偏移还原握手数据。
 
 ## 流量规则
 
@@ -92,9 +91,9 @@
 | `qnum` | `200` | 报文队列编号，对应 `packet.queue` |
 | `hops` | `64` | LAN→WAN 转发报文的 TTL／Hop Limit |
 | `intercept` | `0x1` | 透明投递标记，与策略路由的 `fwmark` 对应 |
-| `generated` | `0x40000000` | nfqws2 的生成报文标记 |
+| `generated` | `0x40000000` | 程序的生成报文标记 |
 
-示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。标记值与宿主的其他流量规则统一分配，`generated` 与 nfqws2 使用的值一致。
+示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。`generated` 与程序使用的标记一致。
 
 `freedomharbor_headers` 表负责转发报文的跳数、IPv4 IPID 和 IPv6 Flow Label。使用以下命令关闭或开启该表：
 
