@@ -67,7 +67,7 @@
 
 ## 报文策略
 
-添加 `[packet]` 后，程序启动并管理 `nfqws2`。该配置与 nftables 中的队列规则配套启用；省略 `[packet]` 时使用仅导入 TCP 的规则。
+添加 `[packet]` 后，程序启动并管理 `nfqws2`。该配置与 nftables 中的队列规则配套启用或停用。
 
 | 字段 | 默认值 | 作用 |
 |---|---|---|
@@ -75,7 +75,6 @@
 | `lua` | `/usr/share/zapret2/lua` | 包含 `zapret-lib.lua` 和 `zapret-antidpi.lua` 的目录 |
 | `http` | `["multidisorder:pos=2,midsld"]` | HTTP 请求报文的 Lua 策略 |
 | `tls` | `["multidisorder:pos=2,midsld"]` | TLS ClientHello 的 Lua 策略 |
-| `quic` | `["fake:blob=fake_default_quic"]` | QUIC Initial 的 Lua 策略 |
 
 策略按列表顺序传给 nfqws2，空列表停用相应的策略动作。动作名称与参数使用 [nfqws2 的 Lua 接口](https://github.com/bol-van/zapret2/blob/master/docs/manual.en.md)。
 
@@ -91,7 +90,6 @@
 | `qnum` | `200` | 报文队列编号，对应 `packet.queue` |
 | `hops` | `64` | LAN→WAN 转发报文的 TTL／Hop Limit |
 | `intercept` | `0x1` | 透明投递标记，与策略路由的 `fwmark` 对应 |
-| `datagram` | `0x20000000` | UDP 报文路径标记 |
 | `generated` | `0x40000000` | nfqws2 的生成报文标记 |
 
 示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。标记值与宿主的其他流量规则统一分配，`generated` 与 nfqws2 使用的值一致。

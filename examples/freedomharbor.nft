@@ -2,7 +2,6 @@ define lan = "lan0"
 define wan = "wan0"
 define port = 15000
 define intercept = 0x1
-define datagram = 0x20000000
 define generated = 0x40000000
 define qnum = 200
 define hops = 64
@@ -16,18 +15,11 @@ table inet freedomharbor {
         iifname $lan meta l4proto tcp fib daddr oifname $wan meta nfproto ipv6 tproxy ip6 to [::1]:$port meta mark set $intercept accept
     }
 
-    # TCP injections carry the external tuple; UDP injections participate in NAT.
+    # TCP injections carry the external tuple.
     chain predefrag {
         type filter hook output priority -401; policy accept;
 
-        meta mark & $generated != 0 meta mark & $datagram == 0 notrack
-    }
-
-    chain datagrams {
-        type filter hook postrouting priority srcnat - 1; policy accept;
-
-        meta mark & $generated != 0 return
-        oifname $wan ct direction original meta l4proto udp @th,64,8 & 0x80 != 0 meta mark set meta mark | $datagram queue num $qnum
+        meta mark & $generated != 0 notrack
     }
 
     chain postrouting {
@@ -41,7 +33,6 @@ table inet freedomharbor {
         type filter hook prerouting priority filter; policy accept;
 
         iifname $wan ct direction reply meta l4proto tcp tcp flags & (syn | fin | rst) != 0 queue num $qnum
-        iifname $wan ct direction reply meta l4proto udp @th,64,8 & 0x80 != 0 meta mark set meta mark | $datagram queue num $qnum
     }
 }
 

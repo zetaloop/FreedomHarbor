@@ -34,10 +34,6 @@ pub async fn run(config: Option<&Packet>, verbose: bool) -> Result<()> {
             command.arg("--lua-desync").arg(action);
         }
     }
-    command.args(["--new", "--filter-udp=*", "--payload=quic_initial"]);
-    for action in &config.quic {
-        command.arg("--lua-desync").arg(action);
-    }
 
     let status = command
         .spawn()
