@@ -112,9 +112,9 @@ pub struct Rule {
 pub struct Packet {
     pub queue: u16,
     pub lua: PathBuf,
-    pub http: Vec<String>,
-    pub tls: Vec<String>,
-    pub quic: Vec<String>,
+    pub http: bool,
+    pub tls: bool,
+    pub quic: bool,
 }
 
 impl Default for Packet {
@@ -122,9 +122,9 @@ impl Default for Packet {
         Self {
             queue: 200,
             lua: "/usr/share/zapret2/lua".into(),
-            http: vec!["multidisorder:pos=2,midsld".into()],
-            tls: vec!["multidisorder:pos=2,midsld".into()],
-            quic: vec!["quic".into()],
+            http: true,
+            tls: true,
+            quic: true,
         }
     }
 }

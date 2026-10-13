@@ -29,18 +29,17 @@ pub async fn run(config: Option<&Packet>, verbose: bool) -> Result<()> {
     }
 
     command.arg("--filter-tcp=*");
-    for (payload, actions) in [
-        ("http_req", &config.http),
-        ("tls_client_hello", &config.tls),
-    ] {
-        command.arg("--payload").arg(payload);
-        for action in actions {
-            command.arg("--lua-desync").arg(action);
+    for (payload, enabled) in [("http_req", config.http), ("tls_client_hello", config.tls)] {
+        if enabled {
+            command
+                .arg("--payload")
+                .arg(payload)
+                .arg("--lua-desync=multidisorder:pos=2,midsld");
         }
     }
     command.args(["--new", "--filter-udp=*"]);
-    for action in &config.quic {
-        command.arg("--lua-desync").arg(action);
+    if config.quic {
+        command.arg("--lua-desync=quic");
     }
 
     let status = command
