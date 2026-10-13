@@ -11,10 +11,16 @@ pub enum Probe {
     Method(Option<usize>),
     Target(bool),
     Scheme,
+    Resource,
+    Version(usize),
     Done(Protocol),
 }
 
 impl Probe {
+    pub fn candidate(&self) -> bool {
+        matches!(self, Self::Resource | Self::Version(_))
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> Option<Protocol> {
         for &byte in data {
             *self = match *self {
@@ -32,12 +38,32 @@ impl Probe {
                 Self::Target(connect)
                     if byte == b'/' || byte == b'*' || (connect && byte.is_ascii_graphic()) =>
                 {
-                    Self::Done(Protocol::Http)
+                    Self::Resource
                 }
                 Self::Target(_) if byte.is_ascii_alphabetic() => Self::Scheme,
-                Self::Scheme if byte == b':' => Self::Done(Protocol::Http),
+                Self::Scheme if byte == b':' => Self::Resource,
                 Self::Scheme if byte.is_ascii_alphanumeric() || b"+-.".contains(&byte) => {
                     Self::Scheme
+                }
+                Self::Resource if byte == b' ' || byte == b'\t' => Self::Version(0),
+                Self::Resource if byte.is_ascii_graphic() => Self::Resource,
+                Self::Version(0) if byte == b' ' || byte == b'\t' => Self::Version(0),
+                Self::Version(8) if byte == b'\n' => Self::Done(Protocol::Http),
+                Self::Version(position)
+                    if match position {
+                        0..=4 => byte == b"HTTP/"[position],
+                        5 | 7 => byte.is_ascii_digit(),
+                        6 => byte == b'.',
+                        8 => byte == b'\r',
+                        9 => byte == b'\n',
+                        _ => false,
+                    } =>
+                {
+                    if position == 9 {
+                        Self::Done(Protocol::Http)
+                    } else {
+                        Self::Version(position + 1)
+                    }
                 }
                 Self::Done(protocol) => Self::Done(protocol),
                 _ => Self::Done(Protocol::Tcp),

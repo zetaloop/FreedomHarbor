@@ -85,6 +85,7 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
     let mut buffer = [0; 8192];
 
     while decision.is_none() {
+        let forwarding = released && !probe.candidate();
         tokio::select! {
             result = &mut connecting, if upstream.is_none() => {
                 upstream = Some(result?);
@@ -92,8 +93,8 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
             }
             state = ready(
                 Some(&client),
-                !released || sent == request.len(),
-                released && received < response.len(),
+                !forwarding || sent == request.len(),
+                forwarding && received < response.len(),
             ) => {
                 let state = state?;
                 if state.is_readable() {
@@ -108,7 +109,7 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
                         Err(error) => return Err(error.into()),
                     }
                 }
-                if decision.is_none() && state.is_writable() && received < response.len() {
+                if decision.is_none() && !probe.candidate() && state.is_writable() && received < response.len() {
                     match client.socket.try_write(&response[received..]) {
                         Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                         Ok(count) => received += count,
@@ -119,8 +120,8 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
             }
             state = ready(
                 upstream.as_ref(),
-                !released || received == response.len(),
-                released && sent < request.len(),
+                !forwarding || received == response.len(),
+                forwarding && sent < request.len(),
             ) => {
                 let state = state?;
                 let stream = upstream.as_ref().expect("upstream ready");
@@ -150,7 +151,7 @@ async fn forward(client: TcpStream, destination: SocketAddr, http: Arc<Http>) ->
                     Some(deadline) => sleep_until(deadline).await,
                     None => pending().await,
                 }
-            }, if !released => released = true,
+            }, if !released && !probe.candidate() => released = true,
         }
     }
 
