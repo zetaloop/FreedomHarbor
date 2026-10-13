@@ -70,6 +70,9 @@ impl Stream {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
             self.output.advance(count);
+            if self.output.is_empty() {
+                self.output = Bytes::new();
+            }
         }
         Poll::Ready(Ok(()))
     }
@@ -220,6 +223,9 @@ fn poll_read(
         let count = prefix.len().min(buf.remaining());
         buf.put_slice(&prefix[..count]);
         prefix.advance(count);
+        if prefix.is_empty() {
+            *prefix = Bytes::new();
+        }
         Poll::Ready(Ok(()))
     }
 }
