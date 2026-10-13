@@ -112,6 +112,7 @@ pub struct Packet {
     pub lua: PathBuf,
     pub http: Vec<String>,
     pub tls: Vec<String>,
+    pub quic: Vec<String>,
 }
 
 impl Default for Packet {
@@ -121,6 +122,7 @@ impl Default for Packet {
             lua: "/usr/share/zapret2/lua".into(),
             http: vec!["multidisorder:pos=2,midsld".into()],
             tls: vec!["multidisorder:pos=2,midsld".into()],
+            quic: vec!["quic".into()],
         }
     }
 }

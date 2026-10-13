@@ -75,8 +75,11 @@
 | `lua` | `/usr/share/zapret2/lua` | 包含 `zapret-lib.lua` 和 `zapret-antidpi.lua` 的目录 |
 | `http` | `["multidisorder:pos=2,midsld"]` | HTTP 请求报文的 Lua 策略 |
 | `tls` | `["multidisorder:pos=2,midsld"]` | TLS ClientHello 的 Lua 策略 |
+| `quic` | `["quic"]` | QUIC Initial 的 CRYPTO 帧布局策略 |
 
 策略按列表顺序传给 nfqws2，空列表停用相应的策略动作。动作名称与参数使用 [nfqws2 的 Lua 接口](https://github.com/bol-van/zapret2/blob/master/docs/manual.en.md)。
+
+内置 `quic` 策略重排 Initial 中的 CRYPTO 帧，并使用原有填充空间重新封装。服务器按帧偏移还原握手数据。
 
 ## 流量规则
 

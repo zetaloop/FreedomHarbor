@@ -20,6 +20,10 @@ pub async fn run(config: Option<&Packet>, verbose: bool) -> Result<()> {
         argument.push(config.lua.join(library));
         command.arg("--lua-init").arg(argument);
     }
+    command
+        .arg("--lua-init")
+        .arg(include_str!("quic.lua"))
+        .arg("--reasm-disable=quic_initial");
     if verbose {
         command.arg("--debug=1");
     }
@@ -33,6 +37,10 @@ pub async fn run(config: Option<&Packet>, verbose: bool) -> Result<()> {
         for action in actions {
             command.arg("--lua-desync").arg(action);
         }
+    }
+    command.args(["--new", "--filter-udp=*"]);
+    for action in &config.quic {
+        command.arg("--lua-desync").arg(action);
     }
 
     let status = command

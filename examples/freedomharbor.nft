@@ -27,6 +27,7 @@ table inet freedomharbor {
 
         meta mark & $generated != 0 return
         oifname $wan ct direction original meta l4proto tcp queue num $qnum
+        oifname $wan ct direction original meta l4proto udp @th,64,8 & 0x80 != 0 @th,72,32 { 0x00000001, 0x6b3343cf } queue num $qnum
     }
 
     chain reply {
