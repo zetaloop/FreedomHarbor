@@ -79,7 +79,10 @@ impl Default for Probe {
                 ],
                 scripts: vec![
                     r"(?s)\bgetIPs\s*\(.*\brtcsetcookie\s*\(.*\bcheckflash\s*\(".into(),
-                    r"(?s)\bsetTimeout\s*\(.*\bsetCookie\s*\(.*\blocation\s*\.\s*replace\s*\(.*\blocation\s*\.\s*href".into(),
+                    format!(
+                        r"^\s*{}\s*$",
+                        regex::escape(r##"setTimeout("try{setCookie();}catch(error){};location.replace(location.href.split(\"#\")[0])",2000);"##),
+                    ),
                 ],
                 ..Rule::default()
             }],
