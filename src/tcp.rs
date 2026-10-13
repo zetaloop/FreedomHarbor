@@ -5,6 +5,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     ptr,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ use tokio::{
         tcp::{ReadHalf, WriteHalf},
     },
     task::JoinSet,
-    time::{Instant, sleep_until},
+    time::{Instant, sleep, sleep_until},
 };
 use tracing::{debug, info, warn};
 
@@ -51,15 +52,40 @@ pub async fn run(addresses: &[SocketAddr], http: Arc<Http>) -> Result<()> {
     }
 
     while let Some(result) = listeners.join_next().await {
-        result.context("listener task failed")??;
+        result.context("listener task failed")?;
     }
     pending().await
 }
 
-async fn accept(listener: TcpListener, http: Arc<Http>) -> io::Result<()> {
+async fn accept(listener: TcpListener, http: Arc<Http>) {
     loop {
-        let (client, source) = listener.accept().await?;
-        let destination = client.local_addr()?;
+        let (client, source) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                debug!(?error, "connection interrupted during accept");
+                continue;
+            }
+            Err(error) => {
+                warn!(?error, "failed to accept connection");
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let destination = match client.local_addr() {
+            Ok(destination) => destination,
+            Err(error) => {
+                warn!(%source, ?error, "failed to read destination");
+                continue;
+            }
+        };
         let http = Arc::clone(&http);
 
         tokio::spawn(async move {
