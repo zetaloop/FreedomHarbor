@@ -5,7 +5,7 @@ use std::{
     ops::Range,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use etherparse::{IpHeaders, IpNumber, TcpHeader, TransportHeader, UdpSlice};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{Interest, unix::AsyncFd};
@@ -14,9 +14,9 @@ use tracing::{debug, info, warn};
 use crate::{
     config::Packet,
     netfilter::{self, Connection, Event, Queue},
-    protocol::{Probe, Protocol},
+    protocol::{self, Probe, Protocol},
     quic,
-    tls::ServerHello,
+    tls::{self, ClientHello, Parse, ServerHello},
 };
 
 const GENERATED: u32 = 0x40000000;
@@ -38,9 +38,10 @@ struct Flow {
 
 struct Hello {
     position: u64,
-    length: usize,
     data: Vec<u8>,
     packets: Vec<(u64, Vec<u8>)>,
+    mark: u32,
+    started: bool,
 }
 
 struct Layout {
@@ -147,6 +148,7 @@ async fn process(
                     && let Some(established) = server.feed(tcp.sequence_number, frame.payload)
                 {
                     flow.server = None;
+                    flow.hello = None;
                     flow.mark = (flow.mark & !STATE) | if established { ESTABLISHED } else { 0 };
                     debug!(established, "TLS server hello observed");
                 }
@@ -194,101 +196,103 @@ async fn process(
                 sender.split(&frame, &cuts, position, packet.output).await?;
                 return Ok(Action::Drop);
             }
+            if frame.payload.is_empty() || authenticated(tcp) {
+                if tcp.fin {
+                    flow.hello = None;
+                }
+                return Ok(Action::Accept);
+            }
+            if flow.hello.is_none() && matches!(frame.payload.first(), Some(20 | 22)) {
+                flow.hello = Some(Hello {
+                    position,
+                    data: Vec::new(),
+                    packets: Vec::new(),
+                    mark: flow.mark & STATE,
+                    started: false,
+                });
+                flow.mark = (flow.mark & !STATE) | HANDSHAKE;
+            }
             if let Some(mut hello) = flow.hello.take() {
-                let retransmitted = position < hello.position + hello.data.len() as u64;
-                if !frame.payload.is_empty() {
-                    hello.packets.push((position, packet.data.clone()));
+                let contiguous = hello.position + hello.data.len() as u64;
+                if position > contiguous {
+                    hello.packets.push((position, frame.payload.to_vec()));
+                } else if end > contiguous {
+                    hello
+                        .data
+                        .extend_from_slice(&frame.payload[(contiguous - position) as usize..]);
                 }
                 hello.packets.sort_by_key(|&(position, _)| position);
+                let mut consumed = 0;
                 for (start, data) in &hello.packets {
                     let contiguous = hello.position + hello.data.len() as u64;
                     if *start > contiguous {
                         break;
                     }
-                    let part = Frame::parse(data)?.context("invalid buffered TCP packet")?;
-                    let consumed = (contiguous - start) as usize;
-                    if consumed < part.payload.len() {
-                        hello.data.extend_from_slice(&part.payload[consumed..]);
+                    let offset = (contiguous - start) as usize;
+                    if offset < data.len() {
+                        hello.data.extend_from_slice(&data[offset..]);
                     }
+                    consumed += 1;
                 }
-                if hello.data.len() >= hello.length || retransmitted || tcp.fin {
-                    let cuts: Vec<_> = split_points(&hello.data, Protocol::Tls)
-                        .into_iter()
-                        .map(|cut| hello.position + cut as u64)
-                        .collect();
-                    flow.layouts.push(Layout {
-                        range: hello.position..hello.position + hello.length as u64,
-                        cuts,
-                    });
-                    let layout = flow.layouts.last().expect("TLS layout");
-                    for (position, data) in hello.packets.iter().rev() {
-                        let part = Frame::parse(data)?.context("invalid buffered TCP packet")?;
-                        sender
-                            .split(&part, &layout.cuts, *position, packet.output)
-                            .await?;
+                hello.packets.drain(..consumed);
+                let mut cuts: Vec<_> = tls::start(&hello.data)
+                    .ok()
+                    .filter(|_| config.tls)
+                    .map(|start| hello.position + start as u64 + 2)
+                    .into_iter()
+                    .collect();
+                let ready = match ClientHello::parse(&hello.data) {
+                    Ok(parsed) => {
+                        if !hello.started {
+                            flow.server = Some(ServerHello::new(tcp.acknowledgment_number));
+                            hello.started = true;
+                        }
+                        if config.tls
+                            && let Some(split) = parsed.split
+                        {
+                            cuts.push(hello.position + split as u64);
+                        }
+                        parsed.ready
                     }
-                    return Ok(if frame.payload.is_empty() {
-                        Action::Accept
-                    } else {
-                        Action::Drop
-                    });
-                }
-                flow.hello = Some(hello);
-                return Ok(if frame.payload.is_empty() {
-                    Action::Accept
+                    Err(Parse::Incomplete) => false,
+                    Err(Parse::Invalid) => {
+                        flow.mark = (flow.mark & !STATE) | hello.mark;
+                        if hello.started {
+                            flow.server = None;
+                        }
+                        cuts.clear();
+                        true
+                    }
+                };
+                if ready || tcp.fin {
+                    if !cuts.is_empty() {
+                        flow.layouts.push(Layout {
+                            range: hello.position..hello.position + hello.data.len() as u64,
+                            cuts: cuts.clone(),
+                        });
+                    }
                 } else {
-                    Action::Drop
-                });
-            }
-            if frame.payload.is_empty() || authenticated(tcp) {
-                return Ok(Action::Accept);
-            }
-            let start = tls_start(frame.payload);
-            let mut probe = Probe::new(true, true);
-            let protocol = match probe.feed(&frame.payload[start..]) {
-                Some(Protocol::Http) => Protocol::Http,
-                Some(Protocol::Tls) => Protocol::Tls,
-                None if matches!(probe, Probe::Resource | Probe::Version(_)) => Protocol::Http,
-                _ => return Ok(Action::Accept),
-            };
-            if protocol == Protocol::Tls {
-                flow.server = Some(ServerHello::new(tcp.acknowledgment_number));
-                flow.mark = (flow.mark & !STATE) | HANDSHAKE;
-            }
-            if (protocol == Protocol::Http && !config.http)
-                || (protocol == Protocol::Tls && !config.tls)
-            {
-                return Ok(Action::Accept);
-            }
-            if protocol == Protocol::Tls && packet.connection.is_some() {
-                let length = start
-                    + usize::from(u16::from_be_bytes([
-                        frame.payload[start + 3],
-                        frame.payload[start + 4],
-                    ]))
-                    + 5;
-                if frame.payload.len() < length && !tcp.fin {
-                    flow.hello = Some(Hello {
-                        position,
-                        length,
-                        data: frame.payload.to_vec(),
-                        packets: vec![(position, packet.data.clone())],
-                    });
+                    flow.hello = Some(hello);
+                }
+                if cuts.iter().any(|&cut| cut > position && cut < end) {
+                    sender.split(&frame, &cuts, position, packet.output).await?;
+                    debug!(protocol = ?Protocol::Tls, "TCP data segmented");
                     return Ok(Action::Drop);
                 }
+                return Ok(Action::Accept);
             }
-            let cuts: Vec<_> = split_points(frame.payload, protocol)
+            let mut probe = Probe::new(config.http, false);
+            match probe.feed(frame.payload) {
+                Some(Protocol::Http) => {}
+                None if matches!(probe, Probe::Resource | Probe::Version(_)) => {}
+                _ => return Ok(Action::Accept),
+            }
+            let cuts: Vec<_> = split_points(frame.payload)
                 .into_iter()
                 .map(|cut| position + cut as u64)
                 .collect();
-            if protocol == Protocol::Tls {
-                flow.layouts.push(Layout {
-                    range: position..end,
-                    cuts: cuts.clone(),
-                });
-            }
             sender.split(&frame, &cuts, position, packet.output).await?;
-            debug!(?protocol, "TCP data segmented");
+            debug!(protocol = ?Protocol::Http, "TCP data segmented");
             return Ok(Action::Drop);
         }
         _ => {}
@@ -459,27 +463,12 @@ fn authenticated(tcp: &TcpHeader) -> bool {
     false
 }
 
-fn split_points(data: &[u8], protocol: Protocol) -> Vec<usize> {
-    let mut points = vec![if protocol == Protocol::Tls {
-        tls_start(data) + 2
-    } else {
-        2
-    }];
-    let host = match protocol {
-        Protocol::Http => http_host(data),
-        Protocol::Tls => tls_host(data),
-        Protocol::Tcp => None,
-    };
-    if let Some(host) = host {
-        let name = &data[host.clone()];
-        let end = name.iter().rposition(|&byte| byte == b'.');
-        if let Some(end) = end {
-            let start = name[..end]
-                .iter()
-                .rposition(|&byte| byte == b'.')
-                .map_or(0, |value| value + 1);
-            points.push(host.start + start + ((end - start) / 2).max(1));
-        }
+fn split_points(data: &[u8]) -> Vec<usize> {
+    let mut points = vec![2];
+    if let Some(host) = http_host(data)
+        && let Some(split) = protocol::domain_split(&data[host.clone()])
+    {
+        points.push(host.start + split);
     }
     points.retain(|&point| point > 0 && point < data.len());
     points.sort_unstable();
@@ -507,59 +496,4 @@ fn http_host(data: &[u8]) -> Option<Range<usize>> {
         offset += line.len() + 1;
     }
     None
-}
-
-fn tls_start(data: &[u8]) -> usize {
-    let mut start = 0;
-    while data.get(start..start + 6).is_some_and(|record| {
-        record[0] == 20 && record[1] == 3 && record[2] <= 3 && record[3..] == [0, 1, 1]
-    }) {
-        start += 6;
-    }
-    start
-}
-
-fn tls_host(data: &[u8]) -> Option<Range<usize>> {
-    let start = tls_start(data);
-    let length = usize::from(u16::from_be_bytes(
-        data.get(start + 3..start + 5)?.try_into().ok()?,
-    ));
-    let data = data.get(start..start + 5 + length)?;
-    let mut position = 43;
-    vector(data, &mut position, 1)?;
-    vector(data, &mut position, 2)?;
-    vector(data, &mut position, 1)?;
-    let extensions = vector(data, &mut position, 2)?;
-    position = extensions.start;
-    while position < extensions.end {
-        let kind = u16::from_be_bytes(data.get(position..position + 2)?.try_into().ok()?);
-        position += 2;
-        let extension = vector(&data[..extensions.end], &mut position, 2)?;
-        if kind == 0 {
-            let mut name = extension.start;
-            let names = vector(&data[..extension.end], &mut name, 2)?;
-            name = names.start;
-            while name < names.end {
-                let kind = *data.get(name)?;
-                name += 1;
-                let value = vector(&data[..names.end], &mut name, 2)?;
-                if kind == 0 {
-                    return Some(start + value.start..start + value.end);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn vector(data: &[u8], position: &mut usize, width: usize) -> Option<Range<usize>> {
-    let length = data
-        .get(*position..*position + width)?
-        .iter()
-        .fold(0_usize, |value, &byte| value << 8 | usize::from(byte));
-    let start = *position + width;
-    let end = start.checked_add(length)?;
-    data.get(start..end)?;
-    *position = end;
-    Some(start..end)
 }

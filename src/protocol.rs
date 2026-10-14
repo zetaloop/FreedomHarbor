@@ -23,7 +23,10 @@ impl Probe {
     }
 
     pub fn candidate(&self) -> bool {
-        matches!(self, Self::Resource | Self::Version(_) | Self::Tls(3..))
+        matches!(
+            self,
+            Self::Resource | Self::Version(_) | Self::Tls(3..) | Self::Done(Protocol::Tls)
+        )
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Option<Protocol> {
@@ -38,14 +41,14 @@ impl Probe {
                 }
                 Self::Tls(position)
                     if match position {
-                        1 | 9 => byte == 3,
-                        2 | 10 => byte <= 3,
-                        3 | 4 | 6..=8 => true,
+                        1 => byte == 3,
+                        2 => byte <= 3,
+                        3 | 4 => true,
                         5 => byte == 1,
                         _ => false,
                     } =>
                 {
-                    if position == 10 {
+                    if position == 5 {
                         Self::Done(Protocol::Tls)
                     } else {
                         Self::Tls(position + 1)
@@ -124,6 +127,15 @@ pub fn response(data: &[u8]) -> Option<Protocol> {
         }
     }
     (data.len() >= 9).then_some(Protocol::Http)
+}
+
+pub fn domain_split(name: &[u8]) -> Option<usize> {
+    let end = name.iter().rposition(|&byte| byte == b'.')?;
+    let start = name[..end]
+        .iter()
+        .rposition(|&byte| byte == b'.')
+        .map_or(0, |value| value + 1);
+    Some(start + ((end - start) / 2).max(1))
 }
 
 fn token(byte: u8) -> bool {

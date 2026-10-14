@@ -27,6 +27,7 @@ use crate::{
     http::{Connecting, Http},
     protocol::{self, Probe, Protocol},
     stream::Stream,
+    tls::{ClientHello, Parse},
 };
 
 pub async fn run(config: &Config, http: Arc<Http>) -> Result<()> {
@@ -116,6 +117,7 @@ async fn forward(
     let mut deadline = None;
     let mut released = false;
     let mut decision = (!http.enabled && !tls).then_some(Protocol::Tcp);
+    let mut hello = None;
     let mut buffer = [0; 8192];
 
     while decision.is_none() {
@@ -191,18 +193,18 @@ async fn forward(
                 }
             }, if !released && !probe.candidate() => released = true,
         }
+        if decision == Some(Protocol::Tls) {
+            match ClientHello::parse(&request) {
+                Ok(parsed) if parsed.ready => hello = Some(parsed),
+                Ok(_) | Err(Parse::Incomplete) => decision = None,
+                Err(Parse::Invalid) => decision = Some(Protocol::Tcp),
+            }
+        }
     }
 
-    if decision == Some(Protocol::Tls) {
+    if let Some(hello) = hello {
         debug!(%destination, "TLS detected");
-        let length = u16::from_be_bytes([request[3], request[4]]);
-        if length > 6 {
-            // The handshake header and legacy version form the first record.
-            let mut record = [request[0], request[1], request[2], 0, 0];
-            record[3..].copy_from_slice(&(length - 6).to_be_bytes());
-            request[3..5].copy_from_slice(&6_u16.to_be_bytes());
-            request.splice(11..11, record);
-        }
+        hello.fragment(&mut request);
     }
 
     if decision != Some(Protocol::Http) {
