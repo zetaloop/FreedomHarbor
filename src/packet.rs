@@ -16,9 +16,15 @@ use crate::{
     netfilter::{self, Connection, Event, Queue},
     protocol::{Probe, Protocol},
     quic,
+    tls::ServerHello,
 };
 
 const GENERATED: u32 = 0x40000000;
+const HANDSHAKE: u32 = 0x10000000;
+const ESTABLISHED: u32 = 0x20000000;
+const SEQUENCE: u32 = 0x80000000;
+const STATE: u32 = HANDSHAKE | ESTABLISHED;
+const MASK: u32 = STATE | SEQUENCE;
 
 #[derive(Default)]
 struct Flow {
@@ -26,6 +32,8 @@ struct Flow {
     hello: Option<Hello>,
     position: Option<(u32, u64)>,
     layouts: Vec<Layout>,
+    server: Option<ServerHello>,
+    mark: u32,
 }
 
 struct Hello {
@@ -70,10 +78,13 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
             Event::Closed(connection) => {
                 flows.remove(&connection);
             }
-            Event::Packet(packet) => {
+            Event::Packet(mut packet) => {
                 let mut temporary = Flow::default();
                 let flow = match &packet.connection {
-                    Some(connection) => flows.entry(connection.clone()).or_default(),
+                    Some(connection) => flows.entry(connection.clone()).or_insert_with(|| Flow {
+                        mark: packet.connection_mark & MASK,
+                        ..Flow::default()
+                    }),
                     None => &mut temporary,
                 };
                 let action = match process(config, &sender, flow, &packet).await {
@@ -83,6 +94,9 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
                         Action::Accept
                     }
                 };
+                if packet.connection.is_some() && flow.mark != packet.connection_mark & MASK {
+                    packet.update = Some((flow.mark, MASK));
+                }
                 match action {
                     Action::Accept => queue.verdict(&packet, true, None).await?,
                     Action::Drop => queue.verdict(&packet, false, None).await?,
@@ -121,16 +135,30 @@ async fn process(
             if tcp.syn {
                 if !packet.reply {
                     flow.hello = None;
+                    flow.server = None;
                     flow.position = Some((tcp.sequence_number.wrapping_add(1), 0));
                     flow.layouts.clear();
+                    flow.mark = tcp.sequence_number.wrapping_add(1) & SEQUENCE;
                 }
                 return Ok(Action::Accept);
             }
             if packet.reply {
+                if let Some(server) = &mut flow.server
+                    && let Some(established) = server.feed(tcp.sequence_number, frame.payload)
+                {
+                    flow.server = None;
+                    flow.mark = (flow.mark & !STATE) | if established { ESTABLISHED } else { 0 };
+                    debug!(established, "TLS server hello observed");
+                }
                 return Ok(Action::Accept);
             }
             let (sequence, reference) = flow.position.unwrap_or((tcp.sequence_number, 0));
-            let distance = i64::from(tcp.sequence_number.wrapping_sub(sequence) as i32);
+            let delta = tcp.sequence_number.wrapping_sub(sequence);
+            let distance = if delta == SEQUENCE {
+                i64::from(delta)
+            } else {
+                i64::from(delta as i32)
+            };
             let Some(position) = reference.checked_add_signed(distance) else {
                 return Ok(Action::Accept);
             };
@@ -141,6 +169,8 @@ async fn process(
                     end,
                 ));
             }
+            flow.mark =
+                (flow.mark & !SEQUENCE) | (flow.position.expect("TCP position").0 & SEQUENCE);
             // TCP serial comparisons cover half of the sequence space.
             flow.layouts
                 .retain(|layout| end.saturating_sub(layout.range.end) < (1 << 31));
@@ -213,16 +243,30 @@ async fn process(
             if frame.payload.is_empty() || authenticated(tcp) {
                 return Ok(Action::Accept);
             }
-            let mut probe = Probe::new(config.http, config.tls);
-            let protocol = match probe.feed(frame.payload) {
+            let start = tls_start(frame.payload);
+            let mut probe = Probe::new(true, true);
+            let protocol = match probe.feed(&frame.payload[start..]) {
                 Some(Protocol::Http) => Protocol::Http,
                 Some(Protocol::Tls) => Protocol::Tls,
                 None if matches!(probe, Probe::Resource | Probe::Version(_)) => Protocol::Http,
                 _ => return Ok(Action::Accept),
             };
+            if protocol == Protocol::Tls {
+                flow.server = Some(ServerHello::new(tcp.acknowledgment_number));
+                flow.mark = (flow.mark & !STATE) | HANDSHAKE;
+            }
+            if (protocol == Protocol::Http && !config.http)
+                || (protocol == Protocol::Tls && !config.tls)
+            {
+                return Ok(Action::Accept);
+            }
             if protocol == Protocol::Tls && packet.connection.is_some() {
-                let length =
-                    usize::from(u16::from_be_bytes([frame.payload[3], frame.payload[4]])) + 5;
+                let length = start
+                    + usize::from(u16::from_be_bytes([
+                        frame.payload[start + 3],
+                        frame.payload[start + 4],
+                    ]))
+                    + 5;
                 if frame.payload.len() < length && !tcp.fin {
                     flow.hello = Some(Hello {
                         position,
@@ -416,7 +460,11 @@ fn authenticated(tcp: &TcpHeader) -> bool {
 }
 
 fn split_points(data: &[u8], protocol: Protocol) -> Vec<usize> {
-    let mut points = vec![2];
+    let mut points = vec![if protocol == Protocol::Tls {
+        tls_start(data) + 2
+    } else {
+        2
+    }];
     let host = match protocol {
         Protocol::Http => http_host(data),
         Protocol::Tls => tls_host(data),
@@ -461,9 +509,22 @@ fn http_host(data: &[u8]) -> Option<Range<usize>> {
     None
 }
 
+fn tls_start(data: &[u8]) -> usize {
+    let mut start = 0;
+    while data.get(start..start + 6).is_some_and(|record| {
+        record[0] == 20 && record[1] == 3 && record[2] <= 3 && record[3..] == [0, 1, 1]
+    }) {
+        start += 6;
+    }
+    start
+}
+
 fn tls_host(data: &[u8]) -> Option<Range<usize>> {
-    let length = usize::from(u16::from_be_bytes(data.get(3..5)?.try_into().ok()?));
-    let data = data.get(..5 + length)?;
+    let start = tls_start(data);
+    let length = usize::from(u16::from_be_bytes(
+        data.get(start + 3..start + 5)?.try_into().ok()?,
+    ));
+    let data = data.get(start..start + 5 + length)?;
     let mut position = 43;
     vector(data, &mut position, 1)?;
     vector(data, &mut position, 2)?;
@@ -483,7 +544,7 @@ fn tls_host(data: &[u8]) -> Option<Range<usize>> {
                 name += 1;
                 let value = vector(&data[..names.end], &mut name, 2)?;
                 if kind == 0 {
-                    return Some(value);
+                    return Some(start + value.start..start + value.end);
                 }
             }
         }

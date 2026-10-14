@@ -28,6 +28,7 @@ struct Header<'a> {
     number: usize,
     length: usize,
     initial: bool,
+    handshake: bool,
 }
 
 impl State {
@@ -44,6 +45,9 @@ impl State {
             };
             output.extend_from_slice(modified.as_deref().unwrap_or(packet));
             changed |= modified.is_some();
+            if header.handshake {
+                self.initial.remove(header.source);
+            }
             remaining = &remaining[header.length..];
         }
         output.extend_from_slice(remaining);
@@ -148,9 +152,9 @@ fn header(data: &[u8]) -> Option<Header<'_>> {
         return None;
     }
     let version = u32::from_be_bytes(data.get(1..5)?.try_into().ok()?);
-    let (version, initial, retry) = match version {
-        1 => (Version::V1, 0, 3),
-        0x6b3343cf => (Version::V2, 1, 0),
+    let (version, initial, retry, handshake) = match version {
+        1 => (Version::V1, 0, 3, 2),
+        0x6b3343cf => (Version::V2, 1, 0, 3),
         _ => return None,
     };
     let kind = first >> 4 & 3;
@@ -174,6 +178,7 @@ fn header(data: &[u8]) -> Option<Header<'_>> {
         number: position,
         length,
         initial: kind == initial,
+        handshake: kind == handshake,
     })
 }
 

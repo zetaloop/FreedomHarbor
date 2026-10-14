@@ -11,6 +11,7 @@ mod quic;
 mod sample;
 mod stream;
 mod tcp;
+mod tls;
 
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 

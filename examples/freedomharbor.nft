@@ -3,6 +3,9 @@ define wan = "wan0"
 define port = 15000
 define intercept = 0x1
 define generated = 0x40000000
+define handshake = 0x10000000
+define established = 0x20000000
+define sequence = 0x80000000
 define qnum = 200
 define hops = 64
 
@@ -26,7 +29,13 @@ table inet freedomharbor {
         type filter hook postrouting priority srcnat + 1; policy accept;
 
         meta mark & $generated != 0 return
-        oifname $wan ct direction original meta l4proto tcp queue num $qnum
+        oifname $wan ct direction original meta l4proto tcp tcp flags & (syn | fin | rst) != 0 queue num $qnum
+        oifname $wan ct direction original meta l4proto tcp ct mark & $established == 0 queue num $qnum
+        # Sequence-space transitions keep TCP stream offsets observable.
+        oifname $wan ct direction original meta l4proto tcp ct mark & $sequence == 0 tcp sequence & $sequence != 0 queue num $qnum
+        oifname $wan ct direction original meta l4proto tcp ct mark & $sequence != 0 tcp sequence & $sequence == 0 queue num $qnum
+        # HTTP token prefixes and TLS handshake records.
+        oifname $wan ct direction original meta l4proto tcp @ih,0,8 { 9-13, 22, 32-33, 35-39, 42-43, 45-46, 48-57, 65-90, 94-122, 124, 126 } queue num $qnum
         oifname $wan ct direction original meta l4proto udp @th,64,8 & 0x80 != 0 @th,72,32 { 0x00000001, 0x6b3343cf } queue num $qnum
     }
 
@@ -34,6 +43,7 @@ table inet freedomharbor {
         type filter hook prerouting priority filter; policy accept;
 
         iifname $wan ct direction reply meta l4proto tcp tcp flags & (syn | fin | rst) != 0 queue num $qnum
+        iifname $wan ct direction reply meta l4proto tcp ct mark & $handshake != 0 queue num $qnum
     }
 }
 

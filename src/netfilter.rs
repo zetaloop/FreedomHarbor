@@ -8,7 +8,7 @@ use neli::{
         nl::NlmF,
         socket::{Msg, NlFamily},
     },
-    genl::{AttrTypeBuilder, NlattrBuilder},
+    genl::{AttrType, NlattrBuilder},
     nl::{NlPayload, NlmsghdrBuilder},
     socket::NlSocket,
     types::{Buffer, GenlBuffer, NlBuffer},
@@ -32,6 +32,8 @@ const CAPTURE_LENGTH: u16 = 13;
 const CONNECTION_TUPLE: u16 = 1;
 const CONNECTION_ID: u16 = 12;
 const CONNECTION_ZONE: u16 = 18;
+const CONNECTION_MARK: u16 = 8;
+const CONNECTION_MASK: u16 = 21;
 const FAIL_OPEN: u32 = 1;
 const CONNTRACK: u32 = 2;
 
@@ -47,6 +49,8 @@ pub struct Packet {
     pub mark: u32,
     pub output: u32,
     pub connection: Option<Connection>,
+    pub connection_mark: u32,
+    pub update: Option<(u32, u32)>,
     pub reply: bool,
     pub data: Vec<u8>,
     pub complete: bool,
@@ -165,10 +169,7 @@ impl Queue {
                 let data = bytes(&attributes, PAYLOAD)
                     .context("missing packet payload")?
                     .to_vec();
-                let connection = bytes(&attributes, CONNECTION)
-                    .map(parse)
-                    .transpose()?
-                    .and_then(|attributes| connection(&attributes));
+                let tracking = bytes(&attributes, CONNECTION).map(parse).transpose()?;
                 self.events.push_back(Event::Packet(Packet {
                     id,
                     mark: integer(&attributes, MARK).unwrap_or_default(),
@@ -176,7 +177,12 @@ impl Queue {
                     reply: matches!(integer(&attributes, CONNECTION_INFO), Some(3 | 4)),
                     complete: integer(&attributes, CAPTURE_LENGTH)
                         .is_none_or(|length| length as usize == data.len()),
-                    connection,
+                    connection: tracking.as_ref().and_then(connection),
+                    connection_mark: tracking
+                        .as_ref()
+                        .and_then(|attributes| integer(attributes, CONNECTION_MARK))
+                        .unwrap_or_default(),
+                    update: None,
                     data,
                 }));
             }
@@ -189,6 +195,12 @@ impl Queue {
         verdict.extend_from_slice(&packet.id.to_be_bytes());
         attribute(&mut payload, VERDICT_HEADER, &verdict)?;
         attribute(&mut payload, MARK, &packet.mark.to_be_bytes())?;
+        if let Some((mark, mask)) = packet.update {
+            let mut tracking = Vec::new();
+            attribute(&mut tracking, CONNECTION_MARK, &mark.to_be_bytes())?;
+            attribute(&mut tracking, CONNECTION_MASK, &mask.to_be_bytes())?;
+            attribute(&mut payload, CONNECTION | 0x8000, &tracking)?;
+        }
         if let Some(data) = data {
             attribute(&mut payload, PAYLOAD, data)?;
         }
@@ -198,8 +210,8 @@ impl Queue {
 
 fn attribute(output: &mut Vec<u8>, kind: u16, payload: &[u8]) -> Result<()> {
     let attribute = NlattrBuilder::default()
-        .nla_type(AttrTypeBuilder::default().nla_type(kind).build()?)
-        .nla_payload(Buffer::from(payload))
+        .nla_type(AttrType::<u16>::from(kind))
+        .nla_payload(payload)
         .build()?;
     let mut encoded = Cursor::new(Vec::new());
     attribute.to_bytes(&mut encoded)?;

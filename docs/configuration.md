@@ -92,8 +92,11 @@ QUIC 处理重排 Initial 中的 CRYPTO 帧，并使用原有填充空间重新�
 | `hops` | `64` | LAN→WAN 转发报文的 TTL／Hop Limit |
 | `intercept` | `0x1` | 透明投递标记，与策略路由的 `fwmark` 对应 |
 | `generated` | `0x40000000` | 程序的生成报文标记 |
+| `handshake` | `0x10000000` | 等待服务端握手消息的连接标记 |
+| `established` | `0x20000000` | 已识别 TLS 服务端握手的连接标记 |
+| `sequence` | `0x80000000` | 出站 TCP 序号的高位 |
 
-示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。`generated` 与程序使用的标记一致。
+示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。`generated` 和三个连接状态标记对应程序使用的位分配。
 
 `freedomharbor_headers` 表负责转发报文的跳数、IPv4 IPID 和 IPv6 Flow Label。使用以下命令关闭或开启该表：
 
