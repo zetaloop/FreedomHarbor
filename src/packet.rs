@@ -3,23 +3,28 @@ use std::{
     future::pending,
     net::{IpAddr, SocketAddr},
     ops::Range,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use anyhow::{Result, ensure};
-use etherparse::{IpHeaders, IpNumber, TcpHeader, TransportHeader, UdpSlice};
+use etherparse::{
+    IpFragOffset, IpHeaders, IpNumber, Ipv6FragmentHeader, TcpHeader, TransportHeader, UdpSlice,
+    checksum::Sum16BitWords,
+};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{Interest, unix::AsyncFd};
 use tracing::{debug, info, warn};
 
 use crate::{
     config::Packet,
-    netfilter::{self, Connection, Event, Queue},
+    netfilter::{self, Connection, Event, Queue, Verdict},
     protocol::{self, Probe, Protocol},
     quic,
-    tls::{self, ClientHello, Parse, ServerHello},
+    tls::{self, Parse, Records, ServerHello},
 };
 
 const GENERATED: u32 = 0x40000000;
+const DISCARD: u32 = 0x08000000;
 const HANDSHAKE: u32 = 0x10000000;
 const ESTABLISHED: u32 = 0x20000000;
 const SEQUENCE: u32 = 0x80000000;
@@ -58,12 +63,14 @@ struct Frame<'a> {
 struct Sender {
     ipv4: AsyncFd<Socket>,
     ipv6: AsyncFd<Socket>,
+    identification: AtomicU32,
 }
 
 enum Action {
     Accept,
     Drop,
     Replace(Vec<u8>),
+    Fragment(Vec<Vec<u8>>, SocketAddr),
 }
 
 pub async fn run(config: Option<&Packet>) -> Result<()> {
@@ -99,9 +106,22 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
                     packet.update = Some((flow.mark, MASK));
                 }
                 match action {
-                    Action::Accept => queue.verdict(&packet, true, None).await?,
-                    Action::Drop => queue.verdict(&packet, false, None).await?,
-                    Action::Replace(data) => queue.verdict(&packet, true, Some(&data)).await?,
+                    Action::Accept => queue.verdict(&packet, Verdict::Accept, None).await?,
+                    Action::Drop => queue.verdict(&packet, Verdict::Drop, None).await?,
+                    Action::Replace(data) => {
+                        queue.verdict(&packet, Verdict::Accept, Some(&data)).await?;
+                    }
+                    Action::Fragment(fragments, destination) => {
+                        // Repeating the hook confirms conntrack before the original is discarded.
+                        packet.mark |= DISCARD;
+                        queue.verdict(&packet, Verdict::Repeat, None).await?;
+                        for fragment in fragments {
+                            if let Err(error) = sender.send(&fragment, destination).await {
+                                warn!(?error, "fragment transmission failed");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -122,10 +142,19 @@ async fn process(
     };
     match &frame.transport {
         TransportHeader::Udp(_) if config.quic && !packet.reply => {
-            if let Some(payload) = flow.quic.rewrite(frame.payload) {
-                return Ok(Action::Replace(
-                    frame.encode(frame.transport.clone(), &payload)?,
-                ));
+            match flow.quic.rewrite(frame.payload) {
+                Some(quic::Action::Replace(payload)) => {
+                    return Ok(Action::Replace(
+                        frame.encode(frame.transport.clone(), &payload)?,
+                    ));
+                }
+                Some(quic::Action::Fragment) => {
+                    return Ok(Action::Fragment(
+                        sender.fragment(&frame, packet.checksum_ready)?,
+                        frame.destination(packet.output),
+                    ));
+                }
+                None => {}
             }
         }
         TransportHeader::Tcp(tcp) => {
@@ -241,7 +270,7 @@ async fn process(
                     .map(|start| hello.position + start as u64 + 2)
                     .into_iter()
                     .collect();
-                let ready = match ClientHello::parse(&hello.data) {
+                let ready = match Records::parse(&hello.data) {
                     Ok(parsed) => {
                         if !hello.started {
                             flow.server = Some(ServerHello::new(tcp.acknowledgment_number));
@@ -252,7 +281,7 @@ async fn process(
                         {
                             cuts.push(hello.position + split as u64);
                         }
-                        parsed.ready
+                        parsed.hello.ready
                     }
                     Err(Parse::Incomplete) => false,
                     Err(Parse::Invalid) => {
@@ -370,6 +399,13 @@ impl Frame<'_> {
 
 impl Sender {
     fn new() -> Result<Self> {
+        let mut seed = [0; 4];
+        rustls::crypto::aws_lc_rs::default_provider()
+            .secure_random
+            .fill(&mut seed)
+            .map_err(|error| {
+                anyhow::anyhow!("packet identification initialization failed: {error:?}")
+            })?;
         let sockets: Result<Vec<_>> = [Domain::IPV4, Domain::IPV6]
             .into_iter()
             .map(|domain| {
@@ -392,6 +428,7 @@ impl Sender {
         Ok(Self {
             ipv4: sockets.next().expect("IPv4 socket"),
             ipv6: sockets.next().expect("IPv6 socket"),
+            identification: AtomicU32::new(u32::from_be_bytes(seed)),
         })
     }
 
@@ -424,19 +461,125 @@ impl Sender {
                 tcp.urg = tcp.urgent_pointer != 0;
             }
             let data = frame.encode(TransportHeader::Tcp(tcp), &frame.payload[span[0]..span[1]])?;
-            let destination = frame.destination(interface);
-            let socket = if destination.is_ipv4() {
-                &self.ipv4
-            } else {
-                &self.ipv6
-            };
-            let length = socket
-                .async_io(Interest::WRITABLE, |socket| {
-                    socket.send_to(&data, &destination.into())
-                })
-                .await?;
-            ensure!(length == data.len(), "incomplete raw packet");
+            self.send(&data, frame.destination(interface)).await?;
         }
+        Ok(())
+    }
+
+    fn fragment(&self, frame: &Frame<'_>, checksum_ready: bool) -> Result<Vec<Vec<u8>>> {
+        let mut transport = frame.transport.clone();
+        let mut payload = Vec::with_capacity(transport.header_len() + frame.payload.len());
+        transport.write(&mut payload)?;
+        payload.extend_from_slice(frame.payload);
+        if !checksum_ready {
+            // The partial checksum already includes the pseudo-header sum.
+            let checksum = Sum16BitWords::new()
+                .add_slice(&payload)
+                .to_ones_complement_with_no_zero()
+                .to_be();
+            match &mut transport {
+                TransportHeader::Tcp(header) => header.checksum = checksum,
+                TransportHeader::Udp(header) => header.checksum = checksum,
+                _ => unreachable!("transport header"),
+            }
+            transport.write(&mut &mut payload[..])?;
+        }
+        let mut ip = frame.ip.clone();
+        let mut data = Vec::new();
+        let mut cut = frame.transport.header_len().div_ceil(8) * 8;
+        let mut identification = self.identification.fetch_add(1, Ordering::Relaxed);
+        match &mut ip {
+            IpHeaders::Ipv4(header, _) => {
+                if identification as u16 == 0 {
+                    identification = self.identification.fetch_add(1, Ordering::Relaxed);
+                }
+                header.identification = identification as u16;
+                header.dont_fragment = false;
+            }
+            IpHeaders::Ipv6(header, extensions) => {
+                let options = if let Some(routing) = &mut extensions.routing {
+                    routing.final_destination_options.take()
+                } else {
+                    extensions.destination_options.take()
+                };
+                let next = if let Some(options) = options {
+                    cut += options.header_len();
+                    options.write(&mut data)?;
+                    IpNumber::IPV6_DESTINATION_OPTIONS
+                } else {
+                    frame.ip.next_header()?
+                };
+                extensions.fragment = Some(Ipv6FragmentHeader::new(
+                    next,
+                    IpFragOffset::ZERO,
+                    true,
+                    identification,
+                ));
+                header.next_header = extensions.set_next_headers(next);
+            }
+        }
+        data.extend_from_slice(&payload);
+        ensure!(cut < data.len(), "packet has no fragmentable payload");
+        let mut fragments = Vec::new();
+        for range in [0..cut, cut..data.len()] {
+            let mut ip = ip.clone();
+            let offset = IpFragOffset::try_from((range.start / 8) as u16)?;
+            match &mut ip {
+                IpHeaders::Ipv4(header, _) => {
+                    header.fragment_offset = offset;
+                    header.more_fragments = range.end < data.len();
+                    if range.start != 0 {
+                        let mut options = header.options.as_slice();
+                        let mut copied = Vec::new();
+                        while let Some(&kind) = options.first() {
+                            match kind {
+                                0 => break,
+                                1 => options = &options[1..],
+                                _ => {
+                                    ensure!(options.len() >= 2, "incomplete IPv4 option");
+                                    let length = usize::from(options[1]);
+                                    ensure!(
+                                        length >= 2 && length <= options.len(),
+                                        "invalid IPv4 option"
+                                    );
+                                    if kind & 0x80 != 0 {
+                                        copied.extend_from_slice(&options[..length]);
+                                    }
+                                    options = &options[length..];
+                                }
+                            }
+                        }
+                        copied.resize(copied.len().div_ceil(4) * 4, 0);
+                        header.options = copied.as_slice().try_into()?;
+                    }
+                }
+                IpHeaders::Ipv6(_, extensions) => {
+                    let fragment = extensions.fragment.as_mut().expect("fragment header");
+                    fragment.fragment_offset = offset;
+                    fragment.more_fragments = range.end < data.len();
+                }
+            }
+            ip.set_payload_len(range.len())?;
+            let mut fragment = Vec::with_capacity(ip.header_len() + range.len());
+            ip.write(&mut fragment)?;
+            fragment.extend_from_slice(&data[range]);
+            fragments.push(fragment);
+        }
+        Ok(fragments)
+    }
+
+    async fn send(&self, data: &[u8], destination: SocketAddr) -> Result<()> {
+        let socket = if destination.is_ipv4() {
+            &self.ipv4
+        } else {
+            &self.ipv6
+        };
+        let length = socket
+            .async_io(Interest::WRITABLE, |socket| {
+                socket.send_to(data, &destination.into())
+            })
+            .await?;
+        ensure!(length == data.len(), "incomplete raw packet");
         Ok(())
     }
 }

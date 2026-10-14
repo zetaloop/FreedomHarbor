@@ -27,7 +27,7 @@ use crate::{
     http::{Connecting, Http},
     protocol::{self, Probe, Protocol},
     stream::Stream,
-    tls::{ClientHello, Parse},
+    tls::{Parse, Records},
 };
 
 pub async fn run(config: &Config, http: Arc<Http>) -> Result<()> {
@@ -194,8 +194,8 @@ async fn forward(
             }, if !released && !probe.candidate() => released = true,
         }
         if decision == Some(Protocol::Tls) {
-            match ClientHello::parse(&request) {
-                Ok(parsed) if parsed.ready => hello = Some(parsed),
+            match Records::parse(&request) {
+                Ok(parsed) if parsed.hello.ready => hello = Some(parsed),
                 Ok(_) | Err(Parse::Incomplete) => decision = None,
                 Err(Parse::Invalid) => decision = Some(Protocol::Tcp),
             }

@@ -75,9 +75,9 @@
 | `queue` | `200` | NFQUEUE 编号，与 nftables 的 `qnum` 对应 |
 | `http` | `true` | HTTP 请求报文的分段与倒序发送 |
 | `tls` | `true` | TLS ClientHello 报文的分段与倒序发送 |
-| `quic` | `true` | QUIC Initial 的 CRYPTO 帧重封装 |
+| `quic` | `true` | QUIC Initial 的 CRYPTO 帧重封装与 IP 分片 |
 
-QUIC 处理重排 Initial 中的 CRYPTO 帧，并使用原有填充空间重新封装。服务器按帧偏移还原握手数据。
+QUIC 按 SNI 与 ECH 位置拆分、排列 CRYPTO 帧，并使用原有 PADDING 容纳首部。空间不足时发送原数据报的 IP 分片。
 
 ## 流量规则
 
@@ -92,11 +92,12 @@ QUIC 处理重排 Initial 中的 CRYPTO 帧，并使用原有填充空间重新�
 | `hops` | `64` | LAN→WAN 转发报文的 TTL／Hop Limit |
 | `intercept` | `0x1` | 透明投递标记，与策略路由的 `fwmark` 对应 |
 | `generated` | `0x40000000` | 程序的生成报文标记 |
+| `discard` | `0x08000000` | 由生成报文替代的原包标记 |
 | `handshake` | `0x10000000` | 等待服务端握手消息的连接标记 |
 | `established` | `0x20000000` | 已识别 TLS 服务端握手的连接标记 |
 | `sequence` | `0x80000000` | 出站 TCP 序号的高位 |
 
-示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。`generated` 和三个连接状态标记对应程序使用的位分配。
+示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。报文与连接状态标记对应程序使用的位分配。
 
 `freedomharbor_headers` 表负责转发报文的跳数、IPv4 IPID 和 IPv6 Flow Label。使用以下命令关闭或开启该表：
 

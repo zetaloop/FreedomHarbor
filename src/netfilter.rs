@@ -29,6 +29,7 @@ const PAYLOAD: u16 = 10;
 const CONNECTION: u16 = 11;
 const CONNECTION_INFO: u16 = 12;
 const CAPTURE_LENGTH: u16 = 13;
+const SKB_INFO: u16 = 14;
 const CONNECTION_TUPLE: u16 = 1;
 const CONNECTION_ID: u16 = 12;
 const CONNECTION_ZONE: u16 = 18;
@@ -36,6 +37,7 @@ const CONNECTION_MARK: u16 = 8;
 const CONNECTION_MASK: u16 = 21;
 const FAIL_OPEN: u32 = 1;
 const CONNTRACK: u32 = 2;
+const CHECKSUM_NOT_READY: u32 = 1;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Connection {
@@ -54,11 +56,18 @@ pub struct Packet {
     pub reply: bool,
     pub data: Vec<u8>,
     pub complete: bool,
+    pub checksum_ready: bool,
 }
 
 pub enum Event {
     Packet(Packet),
     Closed(Connection),
+}
+
+pub enum Verdict {
+    Drop = 0,
+    Accept = 1,
+    Repeat = 4,
 }
 
 pub struct Queue {
@@ -177,6 +186,9 @@ impl Queue {
                     reply: matches!(integer(&attributes, CONNECTION_INFO), Some(3 | 4)),
                     complete: integer(&attributes, CAPTURE_LENGTH)
                         .is_none_or(|length| length as usize == data.len()),
+                    checksum_ready: integer(&attributes, SKB_INFO).unwrap_or_default()
+                        & CHECKSUM_NOT_READY
+                        == 0,
                     connection: tracking.as_ref().and_then(connection),
                     connection_mark: tracking
                         .as_ref()
@@ -189,9 +201,14 @@ impl Queue {
         }
     }
 
-    pub async fn verdict(&self, packet: &Packet, accept: bool, data: Option<&[u8]>) -> Result<()> {
+    pub async fn verdict(
+        &self,
+        packet: &Packet,
+        verdict: Verdict,
+        data: Option<&[u8]>,
+    ) -> Result<()> {
         let mut payload = self.header();
-        let mut verdict = u32::from(accept).to_be_bytes().to_vec();
+        let mut verdict = (verdict as u32).to_be_bytes().to_vec();
         verdict.extend_from_slice(&packet.id.to_be_bytes());
         attribute(&mut payload, VERDICT_HEADER, &verdict)?;
         attribute(&mut payload, MARK, &packet.mark.to_be_bytes())?;

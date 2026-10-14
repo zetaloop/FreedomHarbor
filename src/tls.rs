@@ -14,30 +14,30 @@ pub enum Parse {
 }
 
 pub struct ClientHello {
-    pub split: Option<usize>,
+    pub length: usize,
+    pub sni: Option<Range<usize>>,
+    pub ech: Option<Range<usize>>,
     pub ready: bool,
+}
+
+pub struct Records {
+    pub hello: ClientHello,
+    pub split: Option<usize>,
     records: Vec<(usize, Range<usize>)>,
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
+struct Reader<F> {
+    byte: F,
     position: usize,
-    record: usize,
-    consumed: usize,
     limit: usize,
-    records: Vec<(usize, Range<usize>)>,
 }
 
 impl ClientHello {
-    pub fn parse(data: &[u8]) -> Result<Self, Parse> {
-        let start = start(data)?;
+    pub fn parse(byte: impl FnMut(usize) -> Result<u8, Parse>) -> Result<Self, Parse> {
         let mut reader = Reader {
-            data,
-            position: start,
-            record: start,
-            consumed: 0,
+            byte,
+            position: 0,
             limit: usize::MAX,
-            records: Vec::new(),
         };
         if reader.number(1)? != 1 {
             return Err(Parse::Invalid);
@@ -46,18 +46,69 @@ impl ClientHello {
         if reader.number(1)? != 3 || reader.number(1)? > 3 {
             return Err(Parse::Invalid);
         }
-        let (split, ready) = match reader.split() {
-            Ok(split) => (split, true),
-            Err(Parse::Incomplete) => (None, false),
-            Err(error) => return Err(error),
-        };
         let mut hello = Self {
-            split: None,
-            ready,
-            records: reader.records,
+            length: reader.limit,
+            sni: None,
+            ech: None,
+            ready: false,
         };
-        hello.split = split.and_then(|split| hello.position(split));
+        match reader.fields(&mut hello) {
+            Ok(()) => hello.ready = true,
+            Err(Parse::Incomplete) => {}
+            Err(error) => return Err(error),
+        }
         Ok(hello)
+    }
+}
+
+impl Records {
+    pub fn parse(data: &[u8]) -> Result<Self, Parse> {
+        let mut position = start(data)?;
+        let mut offset = 0;
+        let mut records = Vec::new();
+        let mut end = Parse::Incomplete;
+        while let Some(header) = data.get(position..position + 5) {
+            let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            if header[0] != 22 || header[1] != 3 || header[2] > 3 || length == 0 {
+                end = Parse::Invalid;
+                break;
+            }
+            position += 5;
+            records.push((offset, position..position + length));
+            offset += length;
+            position += length;
+        }
+        let byte = |offset| {
+            let index = records.partition_point(|(start, _)| *start <= offset);
+            let (start, body) = index
+                .checked_sub(1)
+                .and_then(|index| records.get(index))
+                .filter(|(start, body)| offset < start + body.len())
+                .ok_or(end)?;
+            data.get(body.start + offset - start)
+                .copied()
+                .ok_or(Parse::Incomplete)
+        };
+        let mut hello = ClientHello::parse(byte)?;
+        let split = if let Some(sni) = &hello.sni {
+            match sni.clone().map(byte).collect::<Result<Vec<_>, _>>() {
+                Ok(name) => protocol::domain_split(&name).map(|split| sni.start + split),
+                Err(Parse::Incomplete) => {
+                    hello.ready = false;
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut result = Self {
+            hello,
+            split: None,
+            records,
+        };
+        result.split = split.and_then(|split| result.position(split));
+        Ok(result)
     }
 
     pub fn fragment(&self, data: &mut Vec<u8>) {
@@ -86,94 +137,72 @@ impl ClientHello {
     }
 }
 
-impl<'a> Reader<'a> {
-    fn chunk(&mut self, length: usize) -> Result<&'a [u8], Parse> {
-        if length > self.limit - self.consumed {
+impl<F: FnMut(usize) -> Result<u8, Parse>> Reader<F> {
+    fn number(&mut self, width: usize) -> Result<usize, Parse> {
+        if width > self.limit - self.position {
             return Err(Parse::Invalid);
         }
-        if self.position == self.record {
-            let header = self
-                .data
-                .get(self.position..self.position + 5)
-                .ok_or(Parse::Incomplete)?;
-            let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
-            if header[0] != 22 || header[1] != 3 || header[2] > 3 || length == 0 {
-                return Err(Parse::Invalid);
-            }
-            self.position += 5;
-            self.record = self.position + length;
-            self.records
-                .push((self.consumed, self.position..self.record));
-        }
-        let end = (self.position + length).min(self.record);
-        let bytes = self.data.get(self.position..end).ok_or(Parse::Incomplete)?;
-        self.position = end;
-        self.consumed += bytes.len();
-        Ok(bytes)
-    }
-
-    fn number(&mut self, width: usize) -> Result<usize, Parse> {
         let mut value = 0;
         for _ in 0..width {
-            value = value << 8 | usize::from(self.chunk(1)?[0]);
+            value = value << 8 | usize::from((self.byte)(self.position)?);
+            self.position += 1;
         }
         Ok(value)
     }
 
-    fn skip(&mut self, mut length: usize) -> Result<(), Parse> {
-        while length != 0 {
-            length -= self.chunk(length)?.len();
+    fn skip(&mut self, length: usize) -> Result<(), Parse> {
+        if length > self.limit - self.position {
+            return Err(Parse::Invalid);
         }
+        self.position += length;
         Ok(())
     }
 
-    fn vector(&mut self, width: usize) -> Result<usize, Parse> {
+    fn vector(&mut self, width: usize) -> Result<Range<usize>, Parse> {
         let length = self.number(width)?;
-        if length > self.limit - self.consumed {
+        if length > self.limit - self.position {
             return Err(Parse::Invalid);
         }
-        Ok(self.consumed + length)
+        Ok(self.position..self.position + length)
     }
 
-    fn split(&mut self) -> Result<Option<usize>, Parse> {
+    fn fields(&mut self, hello: &mut ClientHello) -> Result<(), Parse> {
         self.skip(32)?;
         for width in [1, 2, 1] {
-            let end = self.vector(width)?;
-            self.skip(end - self.consumed)?;
+            self.position = self.vector(width)?.end;
         }
-        if self.consumed == self.limit {
-            return Ok(None);
+        if self.position == self.limit {
+            return Ok(());
         }
-        if self.vector(2)? != self.limit {
+        if self.vector(2)?.end != self.limit {
             return Err(Parse::Invalid);
         }
-        while self.consumed < self.limit {
+        while self.position < self.limit {
+            let start = self.position;
             let kind = self.number(2)?;
-            let end = self.vector(2)?;
+            let extension = self.vector(2)?;
             if kind == 0 {
-                if self.vector(2)? != end {
+                let names = self.vector(2)?;
+                if names.end != extension.end {
                     return Err(Parse::Invalid);
                 }
-                while self.consumed < end {
+                while self.position < names.end {
                     let kind = self.number(1)?;
-                    let name_end = self.vector(2)?;
-                    if name_end > end {
+                    let name = self.vector(2)?;
+                    if name.end > names.end {
                         return Err(Parse::Invalid);
                     }
                     if kind == 0 {
-                        let start = self.consumed;
-                        let mut name = Vec::new();
-                        while self.consumed < name_end {
-                            name.extend_from_slice(self.chunk(name_end - self.consumed)?);
-                        }
-                        return Ok(protocol::domain_split(&name).map(|split| start + split));
+                        hello.sni.get_or_insert(name.clone());
                     }
-                    self.skip(name_end - self.consumed)?;
+                    self.position = name.end;
                 }
+            } else if kind == 0xfe0d {
+                hello.ech.get_or_insert(start..extension.end);
             }
-            self.skip(end - self.consumed)?;
+            self.position = extension.end;
         }
-        Ok(None)
+        Ok(())
     }
 }
 
