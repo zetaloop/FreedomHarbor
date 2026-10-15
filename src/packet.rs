@@ -20,7 +20,10 @@ use rustls::{
     pki_types::ServerName,
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
-use tokio::io::{Interest, unix::AsyncFd};
+use tokio::{
+    io::{Interest, unix::AsyncFd},
+    task::JoinSet,
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -269,9 +272,40 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
     let mut queue = Queue::open(config.queue).await?;
     let sender = Sender::new(config.spoof)?;
     let mut flows = HashMap::<Connection, Flow>::new();
+    let mut synchronizing = JoinSet::new();
+    let mut resync = false;
     info!(queue = config.queue, "packet processing started");
     loop {
-        match queue.next().await? {
+        if resync && synchronizing.is_empty() {
+            synchronizing.spawn(netfilter::expired(flows.keys().cloned().collect()));
+            resync = false;
+        }
+        let event = tokio::select! {
+            event = queue.next() => event?,
+            result = synchronizing.join_next(), if !synchronizing.is_empty() => {
+                match result.expect("connection synchronization task")
+                    .context("connection synchronization task failed")?
+                {
+                    Ok(expired) => {
+                        let removed = expired.into_iter()
+                            .filter(|connection| flows.remove(connection).is_some())
+                            .count();
+                        debug!(removed, "connection tracking synchronized");
+                    }
+                    Err(error) if netfilter::overflow(&error) => {
+                        warn!(?error, "connection synchronization interrupted");
+                        resync = true;
+                    }
+                    Err(error) => return Err(error.context("connection synchronization failed")),
+                }
+                continue;
+            }
+        };
+        match event {
+            Event::Overflow => {
+                warn!(connections = flows.len(), "netfilter events lost");
+                resync = true;
+            }
             Event::Closed(connection) => {
                 flows.remove(&connection);
             }

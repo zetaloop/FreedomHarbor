@@ -15,10 +15,13 @@ use neli::{
     utils::Groups,
 };
 use tokio::io::{Interest, unix::AsyncFd};
+use tracing::debug;
 
 const NFQ_PACKET: u16 = 0x300;
 const NFQ_VERDICT: u16 = 0x301;
 const NFQ_CONFIG: u16 = 0x302;
+const CT_NEW: u16 = 0x100;
+const CT_GET: u16 = 0x101;
 const CT_DESTROY: u16 = 0x102;
 
 const PACKET_HEADER: u16 = 1;
@@ -41,6 +44,7 @@ const CHECKSUM_NOT_READY: u32 = 1;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Connection {
+    family: u8,
     id: u32,
     tuple: Vec<u8>,
     zone: Vec<u8>,
@@ -62,6 +66,7 @@ pub struct Packet {
 pub enum Event {
     Packet(Packet),
     Closed(Connection),
+    Overflow,
 }
 
 pub enum Verdict {
@@ -79,10 +84,8 @@ pub struct Queue {
 
 impl Queue {
     pub async fn open(number: u16) -> Result<Self> {
-        let socket = NlSocket::connect(NlFamily::Netfilter, None, Groups::new_groups(&[3]))?;
-        socket.nonblock()?;
         let queue = Self {
-            socket: AsyncFd::new(socket)?,
+            socket: socket(Groups::new_groups(&[3]))?,
             number,
             buffer: Vec::new(),
             events: VecDeque::new(),
@@ -94,9 +97,13 @@ impl Queue {
         attribute(&mut payload, 2, &parameters)?;
         attribute(&mut payload, 4, &(FAIL_OPEN | CONNTRACK).to_be_bytes())?;
         attribute(&mut payload, 5, &(FAIL_OPEN | CONNTRACK).to_be_bytes())?;
-        queue
-            .send(NFQ_CONFIG, NlmF::REQUEST | NlmF::ACK, payload)
-            .await?;
+        send(
+            &queue.socket,
+            NFQ_CONFIG,
+            NlmF::REQUEST | NlmF::ACK,
+            payload,
+        )
+        .await?;
         Ok(queue)
     }
 
@@ -106,51 +113,26 @@ impl Queue {
         header
     }
 
-    async fn send(&self, kind: u16, flags: NlmF, payload: Vec<u8>) -> Result<()> {
-        let message = NlmsghdrBuilder::default()
-            .nl_type(kind)
-            .nl_flags(flags)
-            .nl_payload(NlPayload::Payload(Buffer::from(payload)))
-            .build()?;
-        let mut bytes = Cursor::new(Vec::new());
-        message.to_bytes(&mut bytes)?;
-        let bytes = bytes.into_inner();
-        let count = self
-            .socket
-            .async_io(Interest::WRITABLE, |socket| {
-                socket.send(&bytes, Msg::empty())
-            })
-            .await?;
-        ensure!(count == bytes.len(), "incomplete netfilter message");
-        Ok(())
-    }
-
     pub async fn next(&mut self) -> Result<Event> {
         loop {
             if let Some(event) = self.events.pop_front() {
                 return Ok(event);
             }
-            let count = self
-                .socket
-                .async_io(Interest::READABLE, |socket| {
-                    let (length, _) = socket.recv(&mut [], Msg::PEEK | Msg::TRUNC)?;
-                    self.buffer.resize(length, 0);
-                    socket
-                        .recv(&mut self.buffer, Msg::empty())
-                        .map(|(count, _)| count)
-                })
-                .await?;
-            ensure!(count != 0, "netfilter socket closed");
-            // NFQUEUE leaves the final payload attribute unpadded.
-            let length = alignto(count);
-            self.buffer.resize(length, 0);
-            let messages = NlBuffer::<u16, Buffer>::from_bytes_with_input(
-                &mut Cursor::new(&self.buffer),
-                length,
-            )?;
+            let messages = match receive(&self.socket, &mut self.buffer).await {
+                Ok(messages) => messages,
+                Err(error) if overflow(&error) => return Ok(Event::Overflow),
+                Err(error) => return Err(error),
+            };
             for message in messages {
                 let kind = *message.nl_type();
                 let payload = match message.nl_payload() {
+                    NlPayload::Err(error)
+                        if *error.nlmsg().nl_type() == NFQ_VERDICT
+                            && -error.error() == libc::ENOENT =>
+                    {
+                        debug!("packet verdict expired");
+                        continue;
+                    }
                     NlPayload::Err(error) => {
                         return Err(io::Error::from_raw_os_error(-error.error()).into());
                     }
@@ -163,7 +145,7 @@ impl Queue {
                 ensure!(payload.len() >= 4, "incomplete netfilter header");
                 let attributes = parse(&payload[4..])?;
                 if kind == CT_DESTROY {
-                    if let Some(connection) = connection(&attributes) {
+                    if let Some(connection) = connection(payload[0], &attributes) {
                         self.events.push_back(Event::Closed(connection));
                     }
                     continue;
@@ -189,7 +171,9 @@ impl Queue {
                     checksum_ready: integer(&attributes, SKB_INFO).unwrap_or_default()
                         & CHECKSUM_NOT_READY
                         == 0,
-                    connection: tracking.as_ref().and_then(connection),
+                    connection: tracking
+                        .as_ref()
+                        .and_then(|attributes| connection(payload[0], attributes)),
                     connection_mark: tracking
                         .as_ref()
                         .and_then(|attributes| integer(attributes, CONNECTION_MARK))
@@ -221,8 +205,100 @@ impl Queue {
         if let Some(data) = data {
             attribute(&mut payload, PAYLOAD, data)?;
         }
-        self.send(NFQ_VERDICT, NlmF::REQUEST, payload).await
+        send(&self.socket, NFQ_VERDICT, NlmF::REQUEST, payload).await
     }
+}
+
+pub fn overflow(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.raw_os_error() == Some(libc::ENOBUFS))
+}
+
+pub async fn expired(connections: Vec<Connection>) -> Result<Vec<Connection>> {
+    let socket = socket(Groups::new_groups(&[]))?;
+    let mut buffer = Vec::new();
+    let mut expired = Vec::new();
+    'next: for cached in connections {
+        let mut payload = vec![cached.family, 0, 0, 0];
+        attribute(&mut payload, CONNECTION_TUPLE | 0x8000, &cached.tuple)?;
+        if !cached.zone.is_empty() {
+            attribute(&mut payload, CONNECTION_ZONE, &cached.zone)?;
+        }
+        send(&socket, CT_GET, NlmF::REQUEST, payload).await?;
+        loop {
+            for message in receive(&socket, &mut buffer).await? {
+                let payload = match message.nl_payload() {
+                    NlPayload::Err(error) if -error.error() == libc::ENOENT => {
+                        expired.push(cached);
+                        continue 'next;
+                    }
+                    NlPayload::Err(error) => {
+                        return Err(io::Error::from_raw_os_error(-error.error()).into());
+                    }
+                    NlPayload::Payload(payload) if *message.nl_type() == CT_NEW => payload.as_ref(),
+                    _ => continue,
+                };
+                ensure!(payload.len() >= 4, "incomplete conntrack header");
+                let current = connection(payload[0], &parse(&payload[4..])?)
+                    .context("missing connection metadata")?;
+                if current != cached {
+                    expired.push(cached);
+                }
+                continue 'next;
+            }
+        }
+    }
+    Ok(expired)
+}
+
+fn socket(groups: Groups) -> Result<AsyncFd<NlSocket>> {
+    let socket = NlSocket::connect(NlFamily::Netfilter, None, groups)?;
+    socket.nonblock()?;
+    // The kernel's rmem_max determines the receive budget.
+    socket.set_recv_buffer_size(i32::MAX as usize)?;
+    Ok(AsyncFd::new(socket)?)
+}
+
+async fn send(socket: &AsyncFd<NlSocket>, kind: u16, flags: NlmF, payload: Vec<u8>) -> Result<()> {
+    let message = NlmsghdrBuilder::default()
+        .nl_type(kind)
+        .nl_flags(flags)
+        .nl_payload(NlPayload::Payload(Buffer::from(payload)))
+        .build()?;
+    let mut bytes = Cursor::new(Vec::new());
+    message.to_bytes(&mut bytes)?;
+    let bytes = bytes.into_inner();
+    let count = socket
+        .async_io(Interest::WRITABLE, |socket| {
+            socket.send(&bytes, Msg::empty())
+        })
+        .await?;
+    ensure!(count == bytes.len(), "incomplete netfilter message");
+    Ok(())
+}
+
+async fn receive(
+    socket: &AsyncFd<NlSocket>,
+    buffer: &mut Vec<u8>,
+) -> Result<NlBuffer<u16, Buffer>> {
+    let count = socket
+        .async_io(Interest::READABLE, |socket| {
+            let (length, _) = socket.recv(&mut [], Msg::PEEK | Msg::TRUNC)?;
+            buffer.resize(length, 0);
+            socket
+                .recv(buffer.as_mut_slice(), Msg::empty())
+                .map(|(count, _)| count)
+        })
+        .await?;
+    ensure!(count != 0, "netfilter socket closed");
+    // NFQUEUE leaves the final payload attribute unpadded.
+    let length = alignto(count);
+    buffer.resize(length, 0);
+    Ok(NlBuffer::from_bytes_with_input(
+        &mut Cursor::new(buffer.as_slice()),
+        length,
+    )?)
 }
 
 fn attribute(output: &mut Vec<u8>, kind: u16, payload: &[u8]) -> Result<()> {
@@ -248,8 +324,9 @@ fn parse(payload: &[u8]) -> Result<GenlBuffer<u16, Buffer>> {
     )?)
 }
 
-fn connection(attributes: &GenlBuffer<u16, Buffer>) -> Option<Connection> {
+fn connection(family: u8, attributes: &GenlBuffer<u16, Buffer>) -> Option<Connection> {
     Some(Connection {
+        family,
         id: integer(attributes, CONNECTION_ID)?,
         tuple: bytes(attributes, CONNECTION_TUPLE)?.to_vec(),
         zone: bytes(attributes, CONNECTION_ZONE)
