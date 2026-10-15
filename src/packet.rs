@@ -17,14 +17,14 @@ use etherparse::{
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore,
     crypto::aws_lc_rs::{self, kx_group},
-    pki_types::{DnsName, ServerName},
+    pki_types::ServerName,
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{Interest, unix::AsyncFd};
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{self, Packet},
+    config::Packet,
     netfilter::{self, Connection, Event, Queue, Verdict},
     protocol::{self, Probe, Protocol},
     quic,
@@ -85,12 +85,13 @@ struct Sender {
 struct Spoof {
     tls: Arc<ClientConfig>,
     name: ServerName<'static>,
-    prefix: bool,
 }
 
 struct Injection {
     sequence: u32,
+    start: u32,
     payload: Vec<u8>,
+    length: usize,
     maximum: usize,
     offset: Option<usize>,
 }
@@ -107,7 +108,7 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
         return pending().await;
     };
     let mut queue = Queue::open(config.queue).await?;
-    let sender = Sender::new(&config.spoof)?;
+    let sender = Sender::new(config.spoof)?;
     let mut flows = HashMap::<Connection, Flow>::new();
     info!(queue = config.queue, "packet processing started");
     loop {
@@ -462,8 +463,7 @@ impl Frame<'_> {
 }
 
 impl Spoof {
-    fn new(config: &config::Spoof) -> Result<Self> {
-        let name = DnsName::try_from(config.host.clone()).context("invalid packet.spoof.host")?;
+    fn new() -> Result<Self> {
         let mut provider = aws_lc_rs::default_provider();
         provider.kx_groups = vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1];
         let mut tls = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -473,8 +473,7 @@ impl Spoof {
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
             tls: Arc::new(tls),
-            name: ServerName::DnsName(name),
-            prefix: config.prefix,
+            name: ServerName::try_from("example.com")?,
         })
     }
 
@@ -487,8 +486,8 @@ impl Spoof {
 }
 
 impl Sender {
-    fn new(config: &config::Spoof) -> Result<Self> {
-        let spoof = config.enabled.then(|| Spoof::new(config)).transpose()?;
+    fn new(enabled: bool) -> Result<Self> {
+        let spoof = enabled.then(Spoof::new).transpose()?;
         let mut seed = [0; 4];
         rustls::crypto::aws_lc_rs::default_provider()
             .secure_random
@@ -543,8 +542,7 @@ impl Sender {
         };
         let mut payload = spoof.payload()?;
         let length = payload.len();
-        let prefix = spoof.prefix
-            && hello.position <= acknowledged
+        let prefix = hello.position <= acknowledged
             && offset >= hello.position
             && offset <= hello.position + hello.data.len() as u64
             && acknowledged < offset + frame.payload.len() as u64;
@@ -567,12 +565,14 @@ impl Sender {
             .checked_sub(extra)
             .context("TCP headers exceed MSS")?;
         ensure!(maximum != 0, "MSS has no payload space");
-        let sequence = sequence
-            .wrapping_sub((reference - acknowledged) as u32)
-            .wrapping_sub(length as u32);
+        let start = hello.position + tls::start(&hello.data).expect("TLS record") as u64;
         Ok(Some(Injection {
-            sequence,
+            start: sequence.wrapping_sub((reference - start) as u32),
+            sequence: sequence
+                .wrapping_sub((reference - acknowledged) as u32)
+                .wrapping_sub(length as u32),
             payload,
+            length,
             maximum,
             offset: prefix.then_some(acknowledged.saturating_sub(offset) as usize),
         }))
@@ -582,14 +582,20 @@ impl Sender {
         &self,
         frame: &Frame<'_>,
         original: &TcpHeader,
-        injection: Injection,
+        injection: &Injection,
         interface: u32,
+        corrupt: bool,
     ) -> Result<()> {
+        let (sequence, payload) = if corrupt {
+            (injection.start, &injection.payload[..injection.length])
+        } else {
+            (injection.sequence, injection.payload.as_slice())
+        };
         let mut sent = 0;
-        for chunk in injection.payload.rchunks(injection.maximum).rev() {
-            let last = sent + chunk.len() == injection.payload.len();
-            let sequence = injection.sequence.wrapping_add(sent as u32);
-            let tcp = if injection.offset.is_some() && last {
+        for chunk in payload.rchunks(injection.maximum).rev() {
+            let last = sent + chunk.len() == payload.len();
+            let sequence = sequence.wrapping_add(sent as u32);
+            let tcp = if !corrupt && injection.offset.is_some() && last {
                 let mut tcp = original.clone();
                 if tcp.urg {
                     tcp.urgent_pointer = tcp
@@ -612,7 +618,10 @@ impl Sender {
                 tcp.options = original.options.clone();
                 tcp
             };
-            let data = frame.encode(TransportHeader::Tcp(tcp), chunk)?;
+            let mut data = frame.encode(TransportHeader::Tcp(tcp), chunk)?;
+            if corrupt {
+                data[frame.ip.header_len() + 16] ^= 1;
+            }
             self.send(&data, frame.destination(interface)).await?;
             sent += chunk.len();
         }
@@ -631,6 +640,10 @@ impl Sender {
         let TransportHeader::Tcp(original) = &frame.transport else {
             return Ok(Action::Accept);
         };
+        if let Some(injection) = &injection {
+            self.inject(frame, original, injection, interface, true)
+                .await?;
+        }
         let start = injection
             .as_ref()
             .and_then(|injection| injection.offset)
@@ -651,7 +664,8 @@ impl Sender {
                 positions.insert(1, start + length);
             }
         } else if let Some(injection) = injection.take() {
-            self.inject(frame, original, injection, interface).await?;
+            self.inject(frame, original, &injection, interface, false)
+                .await?;
         }
         if positions.len() == 2 && injection.is_none() {
             return Ok(Action::Accept);
@@ -672,7 +686,8 @@ impl Sender {
                 injection
                     .payload
                     .extend_from_slice(&frame.payload[span[0]..span[1]]);
-                self.inject(frame, &tcp, injection, interface).await?;
+                self.inject(frame, &tcp, &injection, interface, false)
+                    .await?;
             } else {
                 let data =
                     frame.encode(TransportHeader::Tcp(tcp), &frame.payload[span[0]..span[1]])?;
