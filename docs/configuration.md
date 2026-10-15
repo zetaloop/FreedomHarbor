@@ -73,14 +73,16 @@
 | 字段 | 默认值 | 作用 |
 |---|---|---|
 | `queue` | `200` | NFQUEUE 编号，与 nftables 的 `qnum` 对应 |
-| `http` | `true` | HTTP 请求报文的分段与倒序发送 |
-| `tls` | `true` | TLS ClientHello 报文的分段与倒序发送 |
+| `http` | `true` | HTTP 请求的字段分段 |
+| `tls` | `true` | TLS ClientHello 的字段分段 |
 | `quic` | `true` | QUIC Initial 的 CRYPTO 帧重封装与 IP 分片 |
-| `spoof` | `true` | TLS 伪握手注入 |
+| `spoof` | `true` | 伪握手与域名片段注入 |
 
 QUIC 按 SNI 与 ECH 位置拆分、排列 CRYPTO 帧，并使用原有 PADDING 容纳首部。空间不足时发送原数据报的 IP 分片。
 
 伪 ClientHello 使用统一的 TLS 配置，随机字段按连接生成。发送器先发送校验和失配的副本，再将同一份伪内容放在对端已确认的序号范围内；与真实片段相接时，通过窗口前缀合包发送。报文长度按握手中协商的 MSS 分段。
+
+HTTP Host 与 TLS SNI 按字段范围穿插同长度的伪域名片段，顺序为真实前缀、伪域名、真实域名、相同的伪域名、真实后缀。伪片段使用错误的 TCP 校验和。字段跨 TCP 包或 TLS 记录时，逐段处理已收到的内容，TLS 记录首部沿用原字节。
 
 ## 流量规则
 

@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::Packet,
     netfilter::{self, Connection, Event, Queue, Verdict},
-    protocol::{self, Probe, Protocol},
+    protocol::{Probe, Protocol},
     quic,
     tls::{self, Parse, Records, ServerHello},
 };
@@ -43,6 +43,7 @@ const MASK: u32 = STATE | SEQUENCE;
 struct Flow {
     quic: quic::State,
     hello: Option<Hello>,
+    request: Option<Request>,
     position: Option<(u32, u64)>,
     layouts: Vec<Layout>,
     server: Option<ServerHello>,
@@ -64,9 +65,30 @@ struct Hello {
     started: bool,
 }
 
+struct Request {
+    position: u64,
+    start: u64,
+    header: Header,
+}
+
+enum Header {
+    Request(Probe),
+    Name(usize),
+    Value,
+    Host {
+        start: u64,
+        label: u64,
+        split: Option<u64>,
+    },
+    Line,
+    End,
+}
+
+#[derive(Default)]
 struct Layout {
     range: Range<u64>,
     cuts: Vec<u64>,
+    hosts: Vec<(u64, Range<u64>)>,
 }
 
 struct Frame<'a> {
@@ -101,6 +123,143 @@ enum Action {
     Drop,
     Replace(Vec<u8>),
     Fragment(Vec<Vec<u8>>, SocketAddr),
+}
+
+impl Layout {
+    fn normalize(&mut self) {
+        self.cuts.sort_unstable();
+        self.cuts.dedup();
+        self.hosts
+            .sort_unstable_by_key(|(host, range)| (*host, range.start));
+        self.hosts.dedup_by(|(host, range), (previous, before)| {
+            if host == previous && range.start <= before.end {
+                before.end = before.end.max(range.end);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+impl Request {
+    fn new(position: u64) -> Self {
+        Self {
+            position,
+            start: position,
+            header: Header::Request(Probe::new(true, false)),
+        }
+    }
+
+    fn feed(&mut self, position: u64, data: &[u8]) -> Layout {
+        let mut layout = Layout {
+            range: position..position + data.len() as u64,
+            ..Layout::default()
+        };
+        if position > self.position {
+            // Packet filtering can skip unclassified stream data.
+            *self = Self::new(position);
+        }
+        let Some(data) = data.get((self.position - position) as usize..) else {
+            return layout;
+        };
+        let begin = self.position;
+        if matches!(self.header, Header::Request(Probe::Done(Protocol::Tcp))) {
+            self.start = begin;
+            self.header = Header::Request(Probe::new(true, false));
+        }
+        for &byte in data {
+            let position = self.position;
+            self.position += 1;
+            match &mut self.header {
+                Header::Request(probe) => match probe.feed(std::slice::from_ref(&byte)) {
+                    Some(Protocol::Http) => {
+                        layout.cuts.push(self.start + 2);
+                        self.header = Header::Name(0);
+                    }
+                    Some(_) => break,
+                    None => {}
+                },
+                Header::Name(0) if byte == b'\r' => self.header = Header::End,
+                Header::Name(0) | Header::End if byte == b'\n' => {
+                    self.start = self.position;
+                    self.header = Header::Request(Probe::new(true, false));
+                }
+                Header::Name(index) if byte.eq_ignore_ascii_case(&b"host:"[*index]) => {
+                    *index += 1;
+                    if *index == 5 {
+                        self.header = Header::Value;
+                    }
+                }
+                Header::Name(_) | Header::Line | Header::End => {
+                    self.header = if byte == b'\n' {
+                        Header::Name(0)
+                    } else {
+                        Header::Line
+                    };
+                }
+                Header::Value if byte == b' ' || byte == b'\t' => {}
+                Header::Value => {
+                    if byte == b'[' || byte == b':' || byte.is_ascii_whitespace() {
+                        self.header = if byte == b'\n' {
+                            Header::Name(0)
+                        } else {
+                            Header::Line
+                        };
+                    } else {
+                        self.header = Header::Host {
+                            start: position,
+                            label: position,
+                            split: None,
+                        };
+                        layout.hosts.push((position, position..self.position));
+                    }
+                }
+                Header::Host {
+                    start,
+                    label,
+                    split,
+                } => {
+                    if byte == b':' || byte.is_ascii_whitespace() {
+                        if let Some(split) = split {
+                            layout.cuts.push(*split);
+                        }
+                        self.header = if byte == b'\n' {
+                            Header::Name(0)
+                        } else {
+                            Header::Line
+                        };
+                    } else {
+                        if byte == b'.' {
+                            *split = Some(*label + ((position - *label) / 2).max(1));
+                            *label = self.position;
+                        }
+                        if let Some((host, range)) = layout.hosts.last_mut()
+                            && host == start
+                            && range.end == position
+                        {
+                            range.end = self.position;
+                        } else {
+                            layout.hosts.push((*start, position..self.position));
+                        }
+                    }
+                }
+            }
+        }
+        if let Header::Request(probe) = &self.header
+            && probe.candidate()
+            && self.start + 2 > begin
+        {
+            layout.cuts.push(self.start + 2);
+        }
+        self.position = begin + data.len() as u64;
+        for &cut in &layout.cuts {
+            layout.range.start = layout.range.start.min(cut.saturating_sub(1));
+        }
+        layout.range.end = layout.range.end.max(self.position);
+        layout.normalize();
+        layout
+    }
 }
 
 pub async fn run(config: Option<&Packet>) -> Result<()> {
@@ -190,6 +349,7 @@ async fn process(
         TransportHeader::Tcp(tcp) => {
             if tcp.rst {
                 flow.hello = None;
+                flow.request = None;
                 return Ok(Action::Accept);
             }
             if packet.reply
@@ -203,6 +363,12 @@ async fn process(
                 {
                     peer.acknowledged =
                         Some(peer.acknowledged.map_or(position, |old| old.max(position)));
+                    if flow.request.is_some() && flow.server.is_none() && flow.hello.is_none() {
+                        flow.layouts.retain(|layout| layout.range.end > position);
+                        if flow.mark & STATE == HANDSHAKE && flow.layouts.is_empty() {
+                            flow.mark &= !STATE;
+                        }
+                    }
                 }
                 if tcp.syn {
                     peer.mss = peer.mss.min(mss(tcp, &frame.ip));
@@ -211,11 +377,12 @@ async fn process(
             if tcp.syn {
                 if !packet.reply {
                     flow.hello = None;
+                    flow.request = None;
                     flow.server = None;
                     flow.position = Some((tcp.sequence_number.wrapping_add(1), 0));
                     flow.layouts.clear();
                     flow.mark = tcp.sequence_number.wrapping_add(1) & SEQUENCE;
-                    flow.peer = sender.spoof.as_ref().map(|_| Peer {
+                    flow.peer = Some(Peer {
                         acknowledged: None,
                         mss: mss(tcp, &frame.ip),
                     });
@@ -256,34 +423,63 @@ async fn process(
             // TCP serial comparisons cover half of the sequence space.
             flow.layouts
                 .retain(|layout| end.saturating_sub(layout.range.end) < (1 << 31));
-            if !frame.payload.is_empty()
-                && flow
-                    .layouts
-                    .iter()
-                    .any(|layout| position < layout.range.end && end > layout.range.start)
-            {
-                let mut cuts: Vec<_> = flow
-                    .layouts
-                    .iter()
-                    .flat_map(|layout| layout.cuts.iter().copied())
-                    .filter(|&cut| cut > position && cut < end)
-                    .collect();
-                if cuts.is_empty() {
-                    return Ok(Action::Accept);
-                }
-                cuts.sort_unstable();
-                cuts.dedup();
-                return sender
-                    .split(&frame, &cuts, position, packet.output, None)
-                    .await;
-            }
             if frame.payload.is_empty() || authenticated(tcp) {
                 if tcp.fin {
                     flow.hello = None;
+                    flow.request = None;
                 }
                 return Ok(Action::Accept);
             }
+            let known = flow
+                .layouts
+                .iter()
+                .any(|layout| position < layout.range.end && end > layout.range.start);
+            let mut layout = if config.http
+                && flow.hello.is_none()
+                && flow.server.is_none()
+                && (flow.request.is_some() || !known)
+                && !matches!(frame.payload.first(), Some(20 | 22))
+            {
+                let layout = flow
+                    .request
+                    .get_or_insert_with(|| Request::new(position))
+                    .feed(position, frame.payload);
+                if !layout.cuts.is_empty() || !layout.hosts.is_empty() {
+                    flow.layouts.push(Layout {
+                        range: layout.range.clone(),
+                        cuts: layout.cuts.clone(),
+                        hosts: layout.hosts.clone(),
+                    });
+                    flow.mark = (flow.mark & !STATE) | HANDSHAKE;
+                }
+                layout
+            } else {
+                Layout {
+                    range: position..end,
+                    ..Layout::default()
+                }
+            };
+            if known || !layout.cuts.is_empty() || !layout.hosts.is_empty() {
+                layout.cuts.extend(
+                    flow.layouts
+                        .iter()
+                        .flat_map(|layout| layout.cuts.iter().copied())
+                        .filter(|&cut| cut > position && cut < end),
+                );
+                layout.hosts.extend(flow.layouts.iter().flat_map(|layout| {
+                    layout
+                        .hosts
+                        .iter()
+                        .filter(|(_, range)| position < range.end && end > range.start)
+                        .cloned()
+                }));
+                layout.normalize();
+                return sender
+                    .split(&frame, &layout, position, packet.output, None)
+                    .await;
+            }
             if flow.hello.is_none() && matches!(frame.payload.first(), Some(20 | 22)) {
+                flow.request = None;
                 flow.hello = Some(Hello {
                     position,
                     data: Vec::new(),
@@ -316,7 +512,8 @@ async fn process(
                     consumed += 1;
                 }
                 hello.packets.drain(..consumed);
-                let mut cuts: Vec<_> = tls::start(&hello.data)
+                layout.range = hello.position..hello.position + hello.data.len() as u64;
+                layout.cuts = tls::start(&hello.data)
                     .ok()
                     .filter(|_| config.tls)
                     .map(|start| hello.position + start as u64 + 2)
@@ -338,7 +535,22 @@ async fn process(
                         if config.tls
                             && let Some(split) = parsed.split
                         {
-                            cuts.push(hello.position + split as u64);
+                            layout.cuts.push(hello.position + split as u64);
+                        }
+                        if config.tls
+                            && let Some(sni) = &parsed.hello.sni
+                        {
+                            let mut ranges = parsed.ranges(sni.clone()).peekable();
+                            if let Some(first) = ranges.peek() {
+                                let host = hello.position + first.start as u64;
+                                layout.hosts.extend(ranges.map(|range| {
+                                    (
+                                        host,
+                                        hello.position + range.start as u64
+                                            ..hello.position + range.end as u64,
+                                    )
+                                }));
+                            }
                         }
                         parsed.hello.ready
                     }
@@ -348,24 +560,33 @@ async fn process(
                         if hello.started {
                             flow.server = None;
                         }
-                        cuts.clear();
+                        layout.cuts.clear();
+                        layout.hosts.clear();
                         true
                     }
                 };
                 if ready || tcp.fin {
-                    if !cuts.is_empty() {
+                    if !layout.cuts.is_empty() || !layout.hosts.is_empty() {
                         flow.layouts.push(Layout {
-                            range: hello.position..hello.position + hello.data.len() as u64,
-                            cuts: cuts.clone(),
+                            range: layout.range.clone(),
+                            cuts: layout.cuts.clone(),
+                            hosts: layout.hosts.clone(),
                         });
                     }
                 } else {
                     flow.hello = Some(hello);
                 }
-                if injection.is_some() || cuts.iter().any(|&cut| cut > position && cut < end) {
+                if injection.is_some()
+                    || layout
+                        .hosts
+                        .iter()
+                        .any(|(_, range)| range.start < end && position < range.end)
+                    || layout.cuts.iter().any(|&cut| cut > position && cut < end)
+                {
                     let spoofed = injection.is_some();
+                    layout.normalize();
                     let action = sender
-                        .split(&frame, &cuts, position, packet.output, injection)
+                        .split(&frame, &layout, position, packet.output, injection)
                         .await?;
                     flow.spoofed |= spoofed;
                     debug!(protocol = ?Protocol::Tls, "TCP data segmented");
@@ -373,21 +594,6 @@ async fn process(
                 }
                 return Ok(Action::Accept);
             }
-            let mut probe = Probe::new(config.http, false);
-            match probe.feed(frame.payload) {
-                Some(Protocol::Http) => {}
-                None if matches!(probe, Probe::Resource | Probe::Version(_)) => {}
-                _ => return Ok(Action::Accept),
-            }
-            let cuts: Vec<_> = split_points(frame.payload)
-                .into_iter()
-                .map(|cut| position + cut as u64)
-                .collect();
-            let action = sender
-                .split(&frame, &cuts, position, packet.output, None)
-                .await?;
-            debug!(protocol = ?Protocol::Http, "TCP data segmented");
-            return Ok(action);
         }
         _ => {}
     }
@@ -618,11 +824,7 @@ impl Sender {
                 tcp.options = original.options.clone();
                 tcp
             };
-            let mut data = frame.encode(TransportHeader::Tcp(tcp), chunk)?;
-            if corrupt {
-                data[frame.ip.header_len() + 16] ^= 1;
-            }
-            self.send(&data, frame.destination(interface)).await?;
+            self.segment(frame, tcp, chunk, interface, corrupt).await?;
             sent += chunk.len();
         }
         debug!("TLS ClientHello spoofed");
@@ -632,7 +834,7 @@ impl Sender {
     async fn split(
         &self,
         frame: &Frame<'_>,
-        cuts: &[u64],
+        layout: &Layout,
         offset: u64,
         interface: u32,
         mut injection: Option<Injection>,
@@ -640,22 +842,78 @@ impl Sender {
         let TransportHeader::Tcp(original) = &frame.transport else {
             return Ok(Action::Accept);
         };
-        if let Some(injection) = &injection {
-            self.inject(frame, original, injection, interface, true)
-                .await?;
-        }
         let start = injection
             .as_ref()
             .and_then(|injection| injection.offset)
             .unwrap_or(0);
         let mut positions = vec![start];
         positions.extend(
-            cuts.iter()
+            layout
+                .cuts
+                .iter()
                 .filter_map(|&cut| cut.checked_sub(offset))
                 .filter_map(|cut| usize::try_from(cut).ok())
                 .filter(|&cut| cut > start && cut < frame.payload.len()),
         );
         positions.push(frame.payload.len());
+        let mut hosts = Vec::new();
+        if let Some(spoof) = &self.spoof {
+            for parts in layout.hosts.chunk_by(|left, right| left.0 == right.0) {
+                let ranges: Vec<_> = parts
+                    .iter()
+                    .filter_map(|(_, range)| {
+                        let begin = range.start.max(offset + start as u64);
+                        let end = range.end.min(offset + frame.payload.len() as u64);
+                        (begin < end).then(|| (begin - offset) as usize..(end - offset) as usize)
+                    })
+                    .collect();
+                let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
+                    continue;
+                };
+                let range = first.start..last.end;
+                let mut payload = vec![0; range.len()];
+                spoof
+                    .tls
+                    .crypto_provider()
+                    .secure_random
+                    .fill(&mut payload)
+                    .map_err(|error| anyhow::anyhow!("hostname generation failed: {error:?}"))?;
+                let mut cursor = range.start;
+                for part in ranges {
+                    payload[cursor - range.start..part.start - range.start]
+                        .copy_from_slice(&frame.payload[cursor..part.start]);
+                    for position in part.clone() {
+                        let byte = &mut payload[position - range.start];
+                        let original = frame.payload[position].to_ascii_lowercase();
+                        *byte = b'a' + *byte % 26;
+                        if original == b'.' {
+                            *byte = b'.';
+                        } else if *byte == original {
+                            *byte = b'a' + (*byte - b'a' + 1) % 26;
+                        }
+                    }
+                    cursor = part.end;
+                }
+                let mut tcp = TcpHeader::new(
+                    original.source_port,
+                    original.destination_port,
+                    original.sequence_number.wrapping_add(range.start as u32),
+                    original.window_size,
+                );
+                tcp.acknowledgment_number = original.acknowledgment_number;
+                tcp.ack = true;
+                tcp.psh = true;
+                tcp.options = original.options.clone();
+                positions.extend([range.start, range.end]);
+                hosts.push((range, tcp, payload));
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        if let Some(injection) = &injection {
+            self.inject(frame, original, injection, interface, true)
+                .await?;
+        }
         if let Some(injection) = &injection
             && injection.offset.is_some()
         {
@@ -667,10 +925,22 @@ impl Sender {
             self.inject(frame, original, &injection, interface, false)
                 .await?;
         }
-        if positions.len() == 2 && injection.is_none() {
+        if positions.len() == 2 && injection.is_none() && hosts.is_empty() {
             return Ok(Action::Accept);
         }
-        for span in positions.windows(2).rev() {
+        for index in 0..positions.len() - 1 {
+            let index = if hosts.is_empty() {
+                positions.len() - 2 - index
+            } else {
+                index
+            };
+            let span = &positions[index..index + 2];
+            if let Some((_, tcp, payload)) =
+                hosts.iter().find(|(range, _, _)| range.start == span[0])
+            {
+                self.segment(frame, tcp.clone(), payload, interface, true)
+                    .await?;
+            }
             let mut tcp = original.clone();
             tcp.sequence_number = tcp.sequence_number.wrapping_add(span[0] as u32);
             tcp.fin &= span[1] == frame.payload.len();
@@ -689,12 +959,37 @@ impl Sender {
                 self.inject(frame, &tcp, &injection, interface, false)
                     .await?;
             } else {
-                let data =
-                    frame.encode(TransportHeader::Tcp(tcp), &frame.payload[span[0]..span[1]])?;
-                self.send(&data, frame.destination(interface)).await?;
+                self.segment(
+                    frame,
+                    tcp,
+                    &frame.payload[span[0]..span[1]],
+                    interface,
+                    false,
+                )
+                .await?;
+            }
+            if let Some((_, tcp, payload)) = hosts.iter().find(|(range, _, _)| range.end == span[1])
+            {
+                self.segment(frame, tcp.clone(), payload, interface, true)
+                    .await?;
             }
         }
         Ok(Action::Drop)
+    }
+
+    async fn segment(
+        &self,
+        frame: &Frame<'_>,
+        tcp: TcpHeader,
+        payload: &[u8],
+        interface: u32,
+        corrupt: bool,
+    ) -> Result<()> {
+        let mut data = frame.encode(TransportHeader::Tcp(tcp), payload)?;
+        if corrupt {
+            data[frame.ip.header_len() + 16] ^= 1;
+        }
+        self.send(&data, frame.destination(interface)).await
     }
 
     fn fragment(&self, frame: &Frame<'_>, checksum_ready: bool) -> Result<Vec<Vec<u8>>> {
@@ -849,39 +1144,4 @@ fn mss(tcp: &TcpHeader, ip: &IpHeaders) -> usize {
             IpHeaders::Ipv4(_, _) => 536,
             IpHeaders::Ipv6(_, _) => 1220,
         })
-}
-
-fn split_points(data: &[u8]) -> Vec<usize> {
-    let mut points = vec![2];
-    if let Some(host) = http_host(data)
-        && let Some(split) = protocol::domain_split(&data[host.clone()])
-    {
-        points.push(host.start + split);
-    }
-    points.retain(|&point| point > 0 && point < data.len());
-    points.sort_unstable();
-    points.dedup();
-    points
-}
-
-fn http_host(data: &[u8]) -> Option<Range<usize>> {
-    let mut offset = 0;
-    for line in data.split(|&byte| byte == b'\n') {
-        if line
-            .get(..5)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"host:"))
-        {
-            let start = 5 + line[5..]
-                .iter()
-                .take_while(|byte| byte.is_ascii_whitespace())
-                .count();
-            let length = line[start..]
-                .iter()
-                .position(|&byte| byte == b':' || byte.is_ascii_whitespace())
-                .unwrap_or(line.len() - start);
-            return Some(offset + start..offset + start + length);
-        }
-        offset += line.len() + 1;
-    }
-    None
 }

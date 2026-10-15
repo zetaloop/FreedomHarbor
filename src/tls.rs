@@ -130,6 +130,14 @@ impl Records {
         }
     }
 
+    pub fn ranges(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
+        self.records.iter().filter_map(move |(offset, body)| {
+            let start = range.start.max(*offset);
+            let end = range.end.min(offset + body.len());
+            (start < end).then(|| body.start + start - offset..body.start + end - offset)
+        })
+    }
+
     fn position(&self, offset: usize) -> Option<usize> {
         self.records.iter().find_map(|(start, body)| {
             (offset >= *start && offset <= start + body.len()).then(|| body.start + offset - start)
