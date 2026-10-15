@@ -79,6 +79,18 @@
 
 QUIC 按 SNI 与 ECH 位置拆分、排列 CRYPTO 帧，并使用原有 PADDING 容纳首部。空间不足时发送原数据报的 IP 分片。
 
+### TLS 伪握手
+
+在 `[packet.spoof]` 中设置：
+
+| 字段 | 默认值 | 作用 |
+|---|---|---|
+| `enabled` | `true` | 为每条连接的首次 ClientHello 发送伪握手 |
+| `host` | `example.com` | 伪握手中的域名 |
+| `prefix` | `true` | 将伪内容与真实握手片段合包 |
+
+伪 ClientHello 使用统一的 TLS 配置，随机字段按连接生成。伪内容的序号位于对端已确认位置之前；窗口前缀方式在真实握手片段前附加伪内容，由接收端裁去过期部分。报文长度按握手中协商的 MSS 分段。
+
 ## 流量规则
 
 `examples/freedomharbor.nft` 中的变量控制流量导入和报头处理：

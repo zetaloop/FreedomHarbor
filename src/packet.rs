@@ -3,20 +3,28 @@ use std::{
     future::pending,
     net::{IpAddr, SocketAddr},
     ops::Range,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use etherparse::{
-    IpFragOffset, IpHeaders, IpNumber, Ipv6FragmentHeader, TcpHeader, TransportHeader, UdpSlice,
-    checksum::Sum16BitWords,
+    IpFragOffset, IpHeaders, IpNumber, Ipv4Header, Ipv6FragmentHeader, Ipv6Header, TcpHeader,
+    TcpOptionElement, TransportHeader, UdpSlice, checksum::Sum16BitWords,
+};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore,
+    crypto::aws_lc_rs::{self, kx_group},
+    pki_types::{DnsName, ServerName},
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{Interest, unix::AsyncFd};
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::Packet,
+    config::{self, Packet},
     netfilter::{self, Connection, Event, Queue, Verdict},
     protocol::{self, Probe, Protocol},
     quic,
@@ -39,6 +47,13 @@ struct Flow {
     layouts: Vec<Layout>,
     server: Option<ServerHello>,
     mark: u32,
+    peer: Option<Peer>,
+    spoofed: bool,
+}
+
+struct Peer {
+    acknowledged: Option<u64>,
+    mss: usize,
 }
 
 struct Hello {
@@ -64,6 +79,20 @@ struct Sender {
     ipv4: AsyncFd<Socket>,
     ipv6: AsyncFd<Socket>,
     identification: AtomicU32,
+    spoof: Option<Spoof>,
+}
+
+struct Spoof {
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    prefix: bool,
+}
+
+struct Injection {
+    sequence: u32,
+    payload: Vec<u8>,
+    maximum: usize,
+    offset: Option<usize>,
 }
 
 enum Action {
@@ -78,7 +107,7 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
         return pending().await;
     };
     let mut queue = Queue::open(config.queue).await?;
-    let sender = Sender::new()?;
+    let sender = Sender::new(&config.spoof)?;
     let mut flows = HashMap::<Connection, Flow>::new();
     info!(queue = config.queue, "packet processing started");
     loop {
@@ -162,6 +191,22 @@ async fn process(
                 flow.hello = None;
                 return Ok(Action::Accept);
             }
+            if packet.reply
+                && tcp.ack
+                && let Some((sequence, reference)) = flow.position
+                && let Some(peer) = &mut flow.peer
+            {
+                let distance = i64::from(tcp.acknowledgment_number.wrapping_sub(sequence) as i32);
+                if let Some(position) = reference.checked_add_signed(distance)
+                    && position <= reference
+                {
+                    peer.acknowledged =
+                        Some(peer.acknowledged.map_or(position, |old| old.max(position)));
+                }
+                if tcp.syn {
+                    peer.mss = peer.mss.min(mss(tcp, &frame.ip));
+                }
+            }
             if tcp.syn {
                 if !packet.reply {
                     flow.hello = None;
@@ -169,6 +214,11 @@ async fn process(
                     flow.position = Some((tcp.sequence_number.wrapping_add(1), 0));
                     flow.layouts.clear();
                     flow.mark = tcp.sequence_number.wrapping_add(1) & SEQUENCE;
+                    flow.peer = sender.spoof.as_ref().map(|_| Peer {
+                        acknowledged: None,
+                        mss: mss(tcp, &frame.ip),
+                    });
+                    flow.spoofed = false;
                 }
                 return Ok(Action::Accept);
             }
@@ -222,8 +272,9 @@ async fn process(
                 }
                 cuts.sort_unstable();
                 cuts.dedup();
-                sender.split(&frame, &cuts, position, packet.output).await?;
-                return Ok(Action::Drop);
+                return sender
+                    .split(&frame, &cuts, position, packet.output, None)
+                    .await;
             }
             if frame.payload.is_empty() || authenticated(tcp) {
                 if tcp.fin {
@@ -270,11 +321,18 @@ async fn process(
                     .map(|start| hello.position + start as u64 + 2)
                     .into_iter()
                     .collect();
+                let mut injection = None;
                 let ready = match Records::parse(&hello.data) {
                     Ok(parsed) => {
                         if !hello.started {
                             flow.server = Some(ServerHello::new(tcp.acknowledgment_number));
                             hello.started = true;
+                            if !flow.spoofed {
+                                match sender.spoof(&frame, &hello, flow, position) {
+                                    Ok(prepared) => injection = prepared,
+                                    Err(error) => warn!(?error, "TLS spoof preparation failed"),
+                                }
+                            }
                         }
                         if config.tls
                             && let Some(split) = parsed.split
@@ -303,10 +361,14 @@ async fn process(
                 } else {
                     flow.hello = Some(hello);
                 }
-                if cuts.iter().any(|&cut| cut > position && cut < end) {
-                    sender.split(&frame, &cuts, position, packet.output).await?;
+                if injection.is_some() || cuts.iter().any(|&cut| cut > position && cut < end) {
+                    let spoofed = injection.is_some();
+                    let action = sender
+                        .split(&frame, &cuts, position, packet.output, injection)
+                        .await?;
+                    flow.spoofed |= spoofed;
                     debug!(protocol = ?Protocol::Tls, "TCP data segmented");
-                    return Ok(Action::Drop);
+                    return Ok(action);
                 }
                 return Ok(Action::Accept);
             }
@@ -320,9 +382,11 @@ async fn process(
                 .into_iter()
                 .map(|cut| position + cut as u64)
                 .collect();
-            sender.split(&frame, &cuts, position, packet.output).await?;
+            let action = sender
+                .split(&frame, &cuts, position, packet.output, None)
+                .await?;
             debug!(protocol = ?Protocol::Http, "TCP data segmented");
-            return Ok(Action::Drop);
+            return Ok(action);
         }
         _ => {}
     }
@@ -397,8 +461,34 @@ impl Frame<'_> {
     }
 }
 
+impl Spoof {
+    fn new(config: &config::Spoof) -> Result<Self> {
+        let name = DnsName::try_from(config.host.clone()).context("invalid packet.spoof.host")?;
+        let mut provider = aws_lc_rs::default_provider();
+        provider.kx_groups = vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1];
+        let mut tls = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(Self {
+            tls: Arc::new(tls),
+            name: ServerName::DnsName(name),
+            prefix: config.prefix,
+        })
+    }
+
+    fn payload(&self) -> Result<Vec<u8>> {
+        let mut connection = ClientConnection::new(Arc::clone(&self.tls), self.name.clone())?;
+        let mut payload = Vec::new();
+        connection.write_tls(&mut payload)?;
+        Ok(payload)
+    }
+}
+
 impl Sender {
-    fn new() -> Result<Self> {
+    fn new(config: &config::Spoof) -> Result<Self> {
+        let spoof = config.enabled.then(|| Spoof::new(config)).transpose()?;
         let mut seed = [0; 4];
         rustls::crypto::aws_lc_rs::default_provider()
             .secure_random
@@ -429,7 +519,105 @@ impl Sender {
             ipv4: sockets.next().expect("IPv4 socket"),
             ipv6: sockets.next().expect("IPv6 socket"),
             identification: AtomicU32::new(u32::from_be_bytes(seed)),
+            spoof,
         })
+    }
+
+    fn spoof(
+        &self,
+        frame: &Frame<'_>,
+        hello: &Hello,
+        flow: &Flow,
+        offset: u64,
+    ) -> Result<Option<Injection>> {
+        let (Some(spoof), Some(peer), Some((sequence, reference))) =
+            (&self.spoof, &flow.peer, flow.position)
+        else {
+            return Ok(None);
+        };
+        let Some(acknowledged) = peer.acknowledged else {
+            return Ok(None);
+        };
+        let TransportHeader::Tcp(original) = &frame.transport else {
+            return Ok(None);
+        };
+        let mut payload = spoof.payload()?;
+        let length = payload.len();
+        let prefix = spoof.prefix
+            && hello.position <= acknowledged
+            && offset >= hello.position
+            && offset <= hello.position + hello.data.len() as u64
+            && acknowledged < offset + frame.payload.len() as u64;
+        if prefix {
+            payload.extend_from_slice(
+                &hello.data[(acknowledged - hello.position) as usize
+                    ..(acknowledged.max(offset) - hello.position) as usize],
+            );
+        }
+        if reference - acknowledged + length as u64 >= 1 << 31 {
+            return Ok(None);
+        }
+        let base = match &frame.ip {
+            IpHeaders::Ipv4(_, _) => Ipv4Header::MIN_LEN,
+            IpHeaders::Ipv6(_, _) => Ipv6Header::LEN,
+        };
+        let extra = frame.ip.header_len() - base + original.header_len() - TcpHeader::MIN_LEN;
+        let maximum = peer
+            .mss
+            .checked_sub(extra)
+            .context("TCP headers exceed MSS")?;
+        ensure!(maximum != 0, "MSS has no payload space");
+        let sequence = sequence
+            .wrapping_sub((reference - acknowledged) as u32)
+            .wrapping_sub(length as u32);
+        Ok(Some(Injection {
+            sequence,
+            payload,
+            maximum,
+            offset: prefix.then_some(acknowledged.saturating_sub(offset) as usize),
+        }))
+    }
+
+    async fn inject(
+        &self,
+        frame: &Frame<'_>,
+        original: &TcpHeader,
+        injection: Injection,
+        interface: u32,
+    ) -> Result<()> {
+        let mut sent = 0;
+        for chunk in injection.payload.rchunks(injection.maximum).rev() {
+            let last = sent + chunk.len() == injection.payload.len();
+            let sequence = injection.sequence.wrapping_add(sent as u32);
+            let tcp = if injection.offset.is_some() && last {
+                let mut tcp = original.clone();
+                if tcp.urg {
+                    tcp.urgent_pointer = tcp
+                        .urgent_pointer
+                        .checked_add(original.sequence_number.wrapping_sub(sequence).try_into()?)
+                        .context("TCP urgent pointer exceeds field length")?;
+                }
+                tcp.sequence_number = sequence;
+                tcp
+            } else {
+                let mut tcp = TcpHeader::new(
+                    original.source_port,
+                    original.destination_port,
+                    sequence,
+                    original.window_size,
+                );
+                tcp.acknowledgment_number = original.acknowledgment_number;
+                tcp.ack = true;
+                tcp.psh = last;
+                tcp.options = original.options.clone();
+                tcp
+            };
+            let data = frame.encode(TransportHeader::Tcp(tcp), chunk)?;
+            self.send(&data, frame.destination(interface)).await?;
+            sent += chunk.len();
+        }
+        debug!("TLS ClientHello spoofed");
+        Ok(())
     }
 
     async fn split(
@@ -438,32 +626,60 @@ impl Sender {
         cuts: &[u64],
         offset: u64,
         interface: u32,
-    ) -> Result<()> {
+        mut injection: Option<Injection>,
+    ) -> Result<Action> {
         let TransportHeader::Tcp(original) = &frame.transport else {
-            return Ok(());
+            return Ok(Action::Accept);
         };
-        let mut positions = vec![0];
+        let start = injection
+            .as_ref()
+            .and_then(|injection| injection.offset)
+            .unwrap_or(0);
+        let mut positions = vec![start];
         positions.extend(
             cuts.iter()
                 .filter_map(|&cut| cut.checked_sub(offset))
                 .filter_map(|cut| usize::try_from(cut).ok())
-                .filter(|&cut| cut > 0 && cut < frame.payload.len()),
+                .filter(|&cut| cut > start && cut < frame.payload.len()),
         );
         positions.push(frame.payload.len());
+        if let Some(injection) = &injection
+            && injection.offset.is_some()
+        {
+            let length = injection.maximum - injection.payload.len().min(injection.maximum - 1);
+            if length < positions[1] - start {
+                positions.insert(1, start + length);
+            }
+        } else if let Some(injection) = injection.take() {
+            self.inject(frame, original, injection, interface).await?;
+        }
+        if positions.len() == 2 && injection.is_none() {
+            return Ok(Action::Accept);
+        }
         for span in positions.windows(2).rev() {
             let mut tcp = original.clone();
             tcp.sequence_number = tcp.sequence_number.wrapping_add(span[0] as u32);
             tcp.fin &= span[1] == frame.payload.len();
             tcp.psh &= span[1] == frame.payload.len();
-            tcp.cwr &= span[0] == 0;
+            tcp.cwr &= span[0] == start;
             if tcp.urg {
                 tcp.urgent_pointer = tcp.urgent_pointer.saturating_sub(span[0] as u16);
                 tcp.urg = tcp.urgent_pointer != 0;
             }
-            let data = frame.encode(TransportHeader::Tcp(tcp), &frame.payload[span[0]..span[1]])?;
-            self.send(&data, frame.destination(interface)).await?;
+            if span[0] == start
+                && let Some(mut injection) = injection.take()
+            {
+                injection
+                    .payload
+                    .extend_from_slice(&frame.payload[span[0]..span[1]]);
+                self.inject(frame, &tcp, injection, interface).await?;
+            } else {
+                let data =
+                    frame.encode(TransportHeader::Tcp(tcp), &frame.payload[span[0]..span[1]])?;
+                self.send(&data, frame.destination(interface)).await?;
+            }
         }
-        Ok(())
+        Ok(Action::Drop)
     }
 
     fn fragment(&self, frame: &Frame<'_>, checksum_ready: bool) -> Result<Vec<Vec<u8>>> {
@@ -604,6 +820,20 @@ fn authenticated(tcp: &TcpHeader) -> bool {
         }
     }
     false
+}
+
+fn mss(tcp: &TcpHeader, ip: &IpHeaders) -> usize {
+    tcp.options_iterator()
+        .find_map(|option| match option {
+            Ok(TcpOptionElement::MaximumSegmentSize(value)) if value != 0 => {
+                Some(usize::from(value))
+            }
+            _ => None,
+        })
+        .unwrap_or(match ip {
+            IpHeaders::Ipv4(_, _) => 536,
+            IpHeaders::Ipv6(_, _) => 1220,
+        })
 }
 
 fn split_points(data: &[u8]) -> Vec<usize> {

@@ -114,6 +114,7 @@ pub struct Packet {
     pub http: bool,
     pub tls: bool,
     pub quic: bool,
+    pub spoof: Spoof,
 }
 
 impl Default for Packet {
@@ -123,6 +124,25 @@ impl Default for Packet {
             http: true,
             tls: true,
             quic: true,
+            spoof: Spoof::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Spoof {
+    pub enabled: bool,
+    pub host: String,
+    pub prefix: bool,
+}
+
+impl Default for Spoof {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: "example.com".into(),
+            prefix: true,
         }
     }
 }
