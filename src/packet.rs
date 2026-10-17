@@ -42,6 +42,9 @@ const SEQUENCE: u32 = 0x80000000;
 const STATE: u32 = HANDSHAKE | ESTABLISHED;
 const MASK: u32 = STATE | SEQUENCE;
 
+// Scaled TCP windows are smaller than 2^30 bytes.
+const ACK_OFFSET: u32 = 1 << 30;
+
 #[derive(Default)]
 struct Flow {
     quic: quic::State,
@@ -382,8 +385,6 @@ async fn process(
         }
         TransportHeader::Tcp(tcp) => {
             if tcp.rst {
-                flow.hello = None;
-                flow.request = None;
                 return Ok(Action::Accept);
             }
             if packet.reply
@@ -457,7 +458,7 @@ async fn process(
             // TCP serial comparisons cover half of the sequence space.
             flow.layouts
                 .retain(|layout| end.saturating_sub(layout.range.end) < (1 << 31));
-            if frame.payload.is_empty() || authenticated(tcp) {
+            if frame.payload.is_empty() || !tcp.ack || authenticated(tcp) {
                 if tcp.fin {
                     flow.hello = None;
                     flow.request = None;
@@ -835,29 +836,16 @@ impl Sender {
         for chunk in payload.rchunks(injection.maximum).rev() {
             let last = sent + chunk.len() == payload.len();
             let sequence = sequence.wrapping_add(sent as u32);
-            let tcp = if !corrupt && injection.offset.is_some() && last {
-                let mut tcp = original.clone();
-                if tcp.urg {
-                    tcp.urgent_pointer = tcp
-                        .urgent_pointer
-                        .checked_add(original.sequence_number.wrapping_sub(sequence).try_into()?)
-                        .context("TCP urgent pointer exceeds field length")?;
-                }
-                tcp.sequence_number = sequence;
-                tcp
-            } else {
-                let mut tcp = TcpHeader::new(
-                    original.source_port,
-                    original.destination_port,
-                    sequence,
-                    original.window_size,
-                );
-                tcp.acknowledgment_number = original.acknowledgment_number;
-                tcp.ack = true;
-                tcp.psh = last;
-                tcp.options = original.options.clone();
-                tcp
-            };
+            let mut tcp = TcpHeader::new(
+                original.source_port,
+                original.destination_port,
+                sequence,
+                original.window_size,
+            );
+            tcp.acknowledgment_number = original.acknowledgment_number.wrapping_add(ACK_OFFSET);
+            tcp.ack = true;
+            tcp.psh = last;
+            tcp.options = original.options.clone();
             self.segment(frame, tcp, chunk, interface, corrupt).await?;
             sent += chunk.len();
         }
@@ -871,23 +859,19 @@ impl Sender {
         layout: &Layout,
         offset: u64,
         interface: u32,
-        mut injection: Option<Injection>,
+        injection: Option<Injection>,
     ) -> Result<Action> {
         let TransportHeader::Tcp(original) = &frame.transport else {
             return Ok(Action::Accept);
         };
-        let start = injection
-            .as_ref()
-            .and_then(|injection| injection.offset)
-            .unwrap_or(0);
-        let mut positions = vec![start];
+        let mut positions = vec![0];
         positions.extend(
             layout
                 .cuts
                 .iter()
                 .filter_map(|&cut| cut.checked_sub(offset))
                 .filter_map(|cut| usize::try_from(cut).ok())
-                .filter(|&cut| cut > start && cut < frame.payload.len()),
+                .filter(|&cut| cut > 0 && cut < frame.payload.len()),
         );
         positions.push(frame.payload.len());
         let mut hosts = Vec::new();
@@ -896,7 +880,7 @@ impl Sender {
                 let ranges: Vec<_> = parts
                     .iter()
                     .filter_map(|(_, range)| {
-                        let begin = range.start.max(offset + start as u64);
+                        let begin = range.start.max(offset);
                         let end = range.end.min(offset + frame.payload.len() as u64);
                         (begin < end).then(|| (begin - offset) as usize..(end - offset) as usize)
                     })
@@ -934,7 +918,7 @@ impl Sender {
                     original.sequence_number.wrapping_add(range.start as u32),
                     original.window_size,
                 );
-                tcp.acknowledgment_number = original.acknowledgment_number;
+                tcp.acknowledgment_number = original.acknowledgment_number.wrapping_add(ACK_OFFSET);
                 tcp.ack = true;
                 tcp.psh = true;
                 tcp.options = original.options.clone();
@@ -944,22 +928,25 @@ impl Sender {
         }
         positions.sort_unstable();
         positions.dedup();
-        if let Some(injection) = &injection {
-            self.inject(frame, original, injection, interface, true)
+        if let Some(mut injection) = injection {
+            self.inject(frame, original, &injection, interface, true)
                 .await?;
-        }
-        if let Some(injection) = &injection
-            && injection.offset.is_some()
-        {
-            let length = injection.maximum - injection.payload.len().min(injection.maximum - 1);
-            if length < positions[1] - start {
-                positions.insert(1, start + length);
+            if let Some(start) = injection.offset {
+                let end = positions
+                    .iter()
+                    .copied()
+                    .find(|&cut| cut > start)
+                    .expect("TCP split position");
+                let length = injection.maximum - injection.payload.len().min(injection.maximum - 1);
+                let end = end.min(start + length);
+                injection
+                    .payload
+                    .extend_from_slice(&frame.payload[start..end]);
             }
-        } else if let Some(injection) = injection.take() {
             self.inject(frame, original, &injection, interface, false)
                 .await?;
         }
-        if positions.len() == 2 && injection.is_none() && hosts.is_empty() {
+        if positions.len() == 2 && hosts.is_empty() {
             return Ok(Action::Accept);
         }
         for index in 0..positions.len() - 1 {
@@ -979,29 +966,19 @@ impl Sender {
             tcp.sequence_number = tcp.sequence_number.wrapping_add(span[0] as u32);
             tcp.fin &= span[1] == frame.payload.len();
             tcp.psh &= span[1] == frame.payload.len();
-            tcp.cwr &= span[0] == start;
+            tcp.cwr &= span[0] == 0;
             if tcp.urg {
                 tcp.urgent_pointer = tcp.urgent_pointer.saturating_sub(span[0] as u16);
                 tcp.urg = tcp.urgent_pointer != 0;
             }
-            if span[0] == start
-                && let Some(mut injection) = injection.take()
-            {
-                injection
-                    .payload
-                    .extend_from_slice(&frame.payload[span[0]..span[1]]);
-                self.inject(frame, &tcp, &injection, interface, false)
-                    .await?;
-            } else {
-                self.segment(
-                    frame,
-                    tcp,
-                    &frame.payload[span[0]..span[1]],
-                    interface,
-                    false,
-                )
-                .await?;
-            }
+            self.segment(
+                frame,
+                tcp,
+                &frame.payload[span[0]..span[1]],
+                interface,
+                false,
+            )
+            .await?;
             if let Some((_, tcp, payload)) = hosts.iter().find(|(range, _, _)| range.end == span[1])
             {
                 self.segment(frame, tcp.clone(), payload, interface, true)
