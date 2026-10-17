@@ -7,6 +7,7 @@ use std::{
 
 use hyper::body::{Buf, Bytes};
 use hyper_util::client::legacy::connect::{Connected, Connection};
+use socket2::SockRef;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -33,6 +34,7 @@ enum Ack {
 impl Stream {
     pub fn new(socket: TcpStream) -> io::Result<Self> {
         socket.set_nodelay(true)?;
+        SockRef::from(&socket).set_keepalive(true)?;
         Ok(Self {
             socket,
             prefix: Bytes::new(),

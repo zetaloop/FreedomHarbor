@@ -13,7 +13,11 @@ mod stream;
 mod tcp;
 mod tls;
 
-use std::{io::IsTerminal, path::PathBuf, sync::Arc};
+use std::{
+    io::{self, IsTerminal},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -43,6 +47,18 @@ async fn main() -> Result<()> {
             Level::INFO
         })
         .init();
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    limit.rlim_cur = limit.rlim_max;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
 
     let config = args
         .config
