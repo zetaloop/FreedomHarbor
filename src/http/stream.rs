@@ -1,13 +1,11 @@
 use std::{
     io::{self, IoSlice},
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll, ready},
 };
 
 use hyper::body::{Buf, Bytes};
 use hyper_util::client::legacy::connect::{Connected, Connection};
-use socket2::SockRef;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -32,21 +30,15 @@ enum Ack {
 }
 
 impl Stream {
-    pub fn new(socket: TcpStream) -> io::Result<Self> {
-        socket.set_nodelay(true)?;
-        SockRef::from(&socket).set_keepalive(true)?;
-        Ok(Self {
+    pub fn new(socket: TcpStream) -> Self {
+        Self {
             socket,
             prefix: Bytes::new(),
             proxied: false,
             output: Bytes::new(),
             skip: 0,
             ack: Ack::Done,
-        })
-    }
-
-    pub async fn connect(destination: SocketAddr) -> io::Result<Self> {
-        Self::new(TcpStream::connect(destination).await?)
+        }
     }
 
     pub fn resume(&mut self, response: &[u8], sent: usize) {

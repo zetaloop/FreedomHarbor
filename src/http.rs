@@ -1,3 +1,5 @@
+mod stream;
+
 use std::{
     convert::Infallible,
     future::Future,
@@ -17,13 +19,20 @@ use http::{
     uri::{Authority, Scheme},
 };
 use http_body_util::BodyExt;
-use hyper::{body::Incoming, service::service_fn, upgrade};
+use hyper::{
+    body::{Bytes, Incoming},
+    service::service_fn,
+    upgrade,
+};
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
-use tokio::io::copy_bidirectional;
+use tokio::{
+    io::{AsyncReadExt, copy_bidirectional},
+    net::TcpStream,
+};
 use tower_service::Service;
 use tracing::{debug, warn};
 
@@ -31,10 +40,13 @@ use crate::{
     body::{self, Body, ResponseBody},
     config, https,
     probe::Probe,
-    stream::Stream,
+    protocol::{self, Protocol},
+    tcp::{self, Prefix},
 };
 
-pub type Connecting = Pin<Box<dyn Future<Output = io::Result<Stream>> + Send>>;
+use stream::Stream;
+
+type Connecting = Pin<Box<dyn Future<Output = io::Result<Stream>> + Send>>;
 
 type Initial = Arc<Mutex<Option<Connecting>>>;
 type PlainClient = Client<Connector, Body>;
@@ -74,7 +86,7 @@ impl Service<Uri> for Connector {
         Box::pin(async move {
             let mut stream = match initial {
                 Some(connecting) => connecting.await?,
-                None => Stream::connect(destination).await?,
+                None => Stream::new(tcp::connect(destination).await?),
             };
             stream.proxied = proxied;
             Ok(TokioIo::new(stream))
@@ -107,10 +119,44 @@ impl Http {
 
     pub async fn serve(
         self: Arc<Self>,
-        client: Stream,
+        client: TcpStream,
         destination: SocketAddr,
-        connecting: Connecting,
+        mut connecting: tcp::Connecting,
+        request: Prefix,
+        mut response: Prefix,
     ) -> Result<()> {
+        if response.sent != 0
+            && !b"HTTP/".starts_with(&response.data)
+            && !response.data.starts_with(b"HTTP/")
+        {
+            if response.data.len() < 9 {
+                let start = response.data.len();
+                response.data.resize(9, 0);
+                let mut upstream = connecting.await?;
+                upstream.read_exact(&mut response.data[start..]).await?;
+                connecting = Box::pin(async move { Ok(upstream) });
+            }
+            if protocol::response(&response.data) != Some(Protocol::Http) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid HTTP server preface",
+                )
+                .into());
+            }
+        }
+        let mut client = Stream::new(client);
+        client.resume(&response.data, response.sent);
+        client.prefix = Bytes::from(request.data);
+        let connecting: Connecting = if request.sent != 0 {
+            drop(connecting);
+            Box::pin(async move { tcp::connect(destination).await.map(Stream::new) })
+        } else {
+            Box::pin(async move {
+                let mut stream = Stream::new(connecting.await?);
+                stream.prefix = Bytes::from(response.data);
+                Ok(stream)
+            })
+        };
         let source = client.socket.peer_addr()?;
         let initial = Arc::new(Mutex::new(Some(connecting)));
         let clients = OnceLock::new();

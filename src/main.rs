@@ -9,7 +9,6 @@ mod probe;
 mod protocol;
 mod quic;
 mod sample;
-mod stream;
 mod tcp;
 mod tls;
 

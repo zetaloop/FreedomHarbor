@@ -12,14 +12,14 @@ use http::{Uri, uri::Authority};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector, HttpsConnectorBuilder, MaybeHttpsStream};
 use hyper_util::rt::TokioIo;
 use moka::future::Cache;
-use tokio::time::timeout;
+use tokio::{net::TcpStream, time::timeout};
 use tower_service::Service;
 use tracing::debug;
 
-use crate::{config, stream::Stream};
+use crate::{config, tcp};
 
 type Key = (SocketAddr, Authority, bool);
-type Connection = MaybeHttpsStream<TokioIo<Stream>>;
+type Connection = MaybeHttpsStream<TokioIo<TcpStream>>;
 
 pub struct Https {
     tls: rustls::ClientConfig,
@@ -40,7 +40,7 @@ pub struct Connector {
 struct Tcp(SocketAddr);
 
 impl Service<Uri> for Tcp {
-    type Response = TokioIo<Stream>;
+    type Response = TokioIo<TcpStream>;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
 
@@ -51,7 +51,7 @@ impl Service<Uri> for Tcp {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let mut destination = self.0;
         destination.set_port(uri.port_u16().unwrap_or(443));
-        Box::pin(async move { Stream::connect(destination).await.map(TokioIo::new) })
+        Box::pin(async move { tcp::connect(destination).await.map(TokioIo::new) })
     }
 }
 

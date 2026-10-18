@@ -1,8 +1,9 @@
 use std::{
-    future::pending,
+    future::{Future, pending},
     io,
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd, BorrowedFd},
+    pin::Pin,
     ptr,
     sync::Arc,
     time::Duration,
@@ -10,9 +11,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use hyper::body::Bytes;
-use socket2::{Domain, Socket, Type};
+use socket2::{Domain, SockRef, Socket, Type};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Interest, Ready},
+    io::{AsyncWriteExt, Interest, Ready},
     net::{
         TcpListener, TcpStream,
         tcp::{ReadHalf, WriteHalf},
@@ -24,11 +25,29 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::Config,
-    http::{Connecting, Http},
+    http::Http,
     protocol::{self, Probe, Protocol},
-    stream::Stream,
     tls::{Parse, Records},
 };
+
+pub type Connecting = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
+
+#[derive(Default)]
+pub struct Prefix {
+    pub data: Vec<u8>,
+    pub sent: usize,
+}
+
+pub async fn connect(destination: SocketAddr) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect(destination).await?;
+    configure(&stream)?;
+    Ok(stream)
+}
+
+fn configure(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    SockRef::from(stream).set_keepalive(true)
+}
 
 pub async fn run(config: &Config, http: Arc<Http>) -> Result<()> {
     let mut listeners = JoinSet::new();
@@ -100,19 +119,17 @@ async fn accept(listener: TcpListener, http: Arc<Http>, tls: bool, timeout: Dura
 }
 
 async fn forward(
-    client: TcpStream,
+    mut client: TcpStream,
     destination: SocketAddr,
     http: Arc<Http>,
     tls: bool,
     timeout: Duration,
 ) -> Result<()> {
-    let mut client = Stream::new(client)?;
-    let mut connecting: Connecting = Box::pin(Stream::connect(destination));
+    configure(&client)?;
+    let mut connecting: Connecting = Box::pin(connect(destination));
     let mut upstream = None;
-    let mut request = Vec::new();
-    let mut response = Vec::new();
-    let mut sent = 0;
-    let mut received = 0;
+    let mut request = Prefix::default();
+    let mut response = Prefix::default();
     let mut probe = Probe::new(http.enabled, tls);
     let mut deadline = None;
     let mut released = false;
@@ -129,26 +146,26 @@ async fn forward(
             }
             state = ready(
                 Some(&client),
-                !forwarding || sent == request.len(),
-                forwarding && received < response.len(),
+                !forwarding || request.sent == request.data.len(),
+                forwarding && response.sent < response.data.len(),
             ) => {
                 let state = state?;
                 if state.is_readable() {
-                    match client.socket.try_read(&mut buffer) {
+                    match client.try_read(&mut buffer) {
                         Ok(0) => decision = Some(Protocol::Tcp),
                         Ok(count) => {
                             deadline.get_or_insert_with(|| Instant::now() + timeout);
-                            request.extend_from_slice(&buffer[..count]);
+                            request.data.extend_from_slice(&buffer[..count]);
                             decision = probe.feed(&buffer[..count]);
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
-                if decision.is_none() && !probe.candidate() && state.is_writable() && received < response.len() {
-                    match client.socket.try_write(&response[received..]) {
+                if decision.is_none() && !probe.candidate() && state.is_writable() && response.sent < response.data.len() {
+                    match client.try_write(&response.data[response.sent..]) {
                         Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-                        Ok(count) => received += count,
+                        Ok(count) => response.sent += count,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -156,19 +173,19 @@ async fn forward(
             }
             state = ready(
                 upstream.as_ref(),
-                !forwarding || received == response.len(),
-                forwarding && sent < request.len(),
+                !forwarding || response.sent == response.data.len(),
+                forwarding && request.sent < request.data.len(),
             ) => {
                 let state = state?;
                 let stream = upstream.as_ref().expect("upstream ready");
                 if state.is_readable() {
-                    match stream.socket.try_read(&mut buffer) {
+                    match stream.try_read(&mut buffer) {
                         Ok(0) => decision = Some(Protocol::Tcp),
                         Ok(count) => {
                             deadline.get_or_insert_with(|| Instant::now() + timeout);
-                            response.extend_from_slice(&buffer[..count]);
+                            response.data.extend_from_slice(&buffer[..count]);
                             decision = if http.enabled {
-                                protocol::response(&response)
+                                protocol::response(&response.data)
                             } else {
                                 Some(Protocol::Tcp)
                             };
@@ -177,10 +194,10 @@ async fn forward(
                         Err(error) => return Err(error.into()),
                     }
                 }
-                if decision.is_none() && state.is_writable() && sent < request.len() {
-                    match stream.socket.try_write(&request[sent..]) {
+                if decision.is_none() && state.is_writable() && request.sent < request.data.len() {
+                    match stream.try_write(&request.data[request.sent..]) {
                         Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-                        Ok(count) => sent += count,
+                        Ok(count) => request.sent += count,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -194,7 +211,7 @@ async fn forward(
             }, if !released && !probe.candidate() => released = true,
         }
         if decision == Some(Protocol::Tls) {
-            match Records::parse(&request) {
+            match Records::parse(&request.data) {
                 Ok(parsed) if parsed.hello.ready => hello = Some(parsed),
                 Ok(_) | Err(Parse::Incomplete) => decision = None,
                 Err(Parse::Invalid) => decision = Some(Protocol::Tcp),
@@ -204,7 +221,7 @@ async fn forward(
 
     if let Some(hello) = hello {
         debug!(%destination, "TLS detected");
-        hello.fragment(&mut request);
+        hello.fragment(&mut request.data);
     }
 
     if decision != Some(Protocol::Http) {
@@ -212,58 +229,37 @@ async fn forward(
             Some(stream) => stream,
             None => connecting.await?,
         };
-        let (client_read, client_write) = client.socket.split();
-        let (upstream_read, upstream_write) = upstream.socket.split();
+        let (client_read, client_write) = client.split();
+        let (upstream_read, upstream_write) = upstream.split();
         let (forwarded, returned) = tokio::try_join!(
             transfer(
                 client_read,
                 upstream_write,
-                Bytes::from(request).slice(sent..),
+                Bytes::from(request.data).slice(request.sent..),
             ),
             transfer(
                 upstream_read,
                 client_write,
-                Bytes::from(response).slice(received..),
+                Bytes::from(response.data).slice(response.sent..),
             ),
         )?;
         debug!(
             %destination,
-            sent = forwarded + sent as u64,
-            received = returned + received as u64,
+            sent = forwarded + request.sent as u64,
+            received = returned + response.sent as u64,
             "connection closed"
         );
         return Ok(());
     }
 
     debug!(%destination, "HTTP detected");
-    if received != 0 && !b"HTTP/".starts_with(&response) && !response.starts_with(b"HTTP/") {
-        if response.len() < 9 {
-            let start = response.len();
-            response.resize(9, 0);
-            upstream
-                .as_mut()
-                .expect("received upstream data")
-                .read_exact(&mut response[start..])
-                .await?;
-        }
-        if protocol::response(&response) != Some(Protocol::Http) {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP server preface").into(),
-            );
-        }
-    }
-    client.resume(&response, received);
-    client.prefix = Bytes::from(request);
-    let initial = if sent != 0 {
-        drop(upstream);
-        Box::pin(Stream::connect(destination)) as Connecting
-    } else if let Some(mut stream) = upstream {
-        stream.prefix = Bytes::from(response);
+    let initial = if let Some(stream) = upstream {
         Box::pin(async move { Ok(stream) }) as Connecting
     } else {
         connecting
     };
-    http.serve(client, destination, initial).await
+    http.serve(client, destination, initial, request, response)
+        .await
 }
 
 async fn transfer(
@@ -331,7 +327,7 @@ fn splice(source: BorrowedFd<'_>, destination: BorrowedFd<'_>, length: usize) ->
     }
 }
 
-async fn ready(stream: Option<&Stream>, read: bool, write: bool) -> io::Result<Ready> {
+async fn ready(stream: Option<&TcpStream>, read: bool, write: bool) -> io::Result<Ready> {
     let interest = match (read, write) {
         (true, true) => Some(Interest::READABLE | Interest::WRITABLE),
         (true, false) => Some(Interest::READABLE),
@@ -339,7 +335,7 @@ async fn ready(stream: Option<&Stream>, read: bool, write: bool) -> io::Result<R
         (false, false) => None,
     };
     match (stream, interest) {
-        (Some(stream), Some(interest)) => stream.socket.ready(interest).await,
+        (Some(stream), Some(interest)) => stream.ready(interest).await,
         _ => pending().await,
     }
 }
