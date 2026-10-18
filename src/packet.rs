@@ -107,7 +107,6 @@ struct Sender {
     ipv4: AsyncFd<Socket>,
     ipv6: AsyncFd<Socket>,
     identification: AtomicU32,
-    spoof: Option<Spoof>,
 }
 
 struct Spoof {
@@ -126,26 +125,13 @@ struct Injection {
 
 enum Action {
     Accept,
-    Drop,
+    Split {
+        layout: Layout,
+        offset: u64,
+        injection: Option<Injection>,
+    },
     Replace(Vec<u8>),
     Fragment(Vec<Vec<u8>>, SocketAddr),
-}
-
-impl Layout {
-    fn normalize(&mut self) {
-        self.cuts.sort_unstable();
-        self.cuts.dedup();
-        self.hosts
-            .sort_unstable_by_key(|(host, range)| (*host, range.start));
-        self.hosts.dedup_by(|(host, range), (previous, before)| {
-            if host == previous && range.start <= before.end {
-                before.end = before.end.max(range.end);
-                true
-            } else {
-                false
-            }
-        });
-    }
 }
 
 impl Request {
@@ -273,7 +259,8 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
         return pending().await;
     };
     let mut queue = Queue::open(config.queue).await?;
-    let sender = Sender::new(config.spoof)?;
+    let spoof = config.spoof.then(Spoof::new).transpose()?;
+    let sender = Sender::new()?;
     let mut flows = HashMap::<Connection, Flow>::new();
     let mut synchronizing = JoinSet::new();
     let mut resync = false;
@@ -321,7 +308,21 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
                     }),
                     None => &mut temporary,
                 };
-                let action = match process(config, &sender, flow, &packet).await {
+                let frame = if packet.complete {
+                    match Frame::parse(&packet.data) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            warn!(?error, "packet processing failed");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let action = frame.as_ref().map_or(Ok(Action::Accept), |frame| {
+                    process(config, spoof.as_ref(), &sender, flow, &packet, frame)
+                });
+                let action = match action {
                     Ok(action) => action,
                     Err(error) => {
                         warn!(?error, "packet processing failed");
@@ -333,7 +334,34 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
                 }
                 match action {
                     Action::Accept => queue.verdict(&packet, Verdict::Accept, None).await?,
-                    Action::Drop => queue.verdict(&packet, Verdict::Drop, None).await?,
+                    Action::Split {
+                        layout,
+                        offset,
+                        injection,
+                    } => {
+                        let spoofed = injection.is_some();
+                        let verdict = match layout
+                            .send(
+                                frame.as_ref().expect("parsed packet"),
+                                &sender,
+                                spoof.as_ref(),
+                                offset,
+                                packet.output,
+                                injection,
+                            )
+                            .await
+                        {
+                            Ok(verdict) => {
+                                flow.spoofed |= spoofed;
+                                verdict
+                            }
+                            Err(error) => {
+                                warn!(?error, "packet processing failed");
+                                Verdict::Accept
+                            }
+                        };
+                        queue.verdict(&packet, verdict, None).await?;
+                    }
                     Action::Replace(data) => {
                         queue.verdict(&packet, Verdict::Accept, Some(&data)).await?;
                     }
@@ -354,18 +382,14 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
     }
 }
 
-async fn process(
+fn process(
     config: &Packet,
+    spoof: Option<&Spoof>,
     sender: &Sender,
     flow: &mut Flow,
     packet: &netfilter::Packet,
+    frame: &Frame<'_>,
 ) -> Result<Action> {
-    if !packet.complete {
-        return Ok(Action::Accept);
-    }
-    let Some(frame) = Frame::parse(&packet.data)? else {
-        return Ok(Action::Accept);
-    };
     match &frame.transport {
         TransportHeader::Udp(_) if config.quic && !packet.reply => {
             match flow.quic.rewrite(frame.payload) {
@@ -376,7 +400,7 @@ async fn process(
                 }
                 Some(quic::Action::Fragment) => {
                     return Ok(Action::Fragment(
-                        sender.fragment(&frame, packet.checksum_ready)?,
+                        sender.fragment(frame, packet.checksum_ready)?,
                         frame.destination(packet.output),
                     ));
                 }
@@ -509,9 +533,11 @@ async fn process(
                         .cloned()
                 }));
                 layout.normalize();
-                return sender
-                    .split(&frame, &layout, position, packet.output, None)
-                    .await;
+                return Ok(Action::Split {
+                    layout,
+                    offset: position,
+                    injection: None,
+                });
             }
             if flow.hello.is_none() && matches!(frame.payload.first(), Some(20 | 22)) {
                 flow.request = None;
@@ -560,8 +586,10 @@ async fn process(
                         if !hello.started {
                             flow.server = Some(ServerHello::new(tcp.acknowledgment_number));
                             hello.started = true;
-                            if !flow.spoofed {
-                                match sender.spoof(&frame, &hello, flow, position) {
+                            if !flow.spoofed
+                                && let Some(spoof) = spoof
+                            {
+                                match spoof.prepare(frame, &hello, flow, position) {
                                     Ok(prepared) => injection = prepared,
                                     Err(error) => warn!(?error, "TLS spoof preparation failed"),
                                 }
@@ -618,14 +646,12 @@ async fn process(
                         .any(|(_, range)| range.start < end && position < range.end)
                     || layout.cuts.iter().any(|&cut| cut > position && cut < end)
                 {
-                    let spoofed = injection.is_some();
                     layout.normalize();
-                    let action = sender
-                        .split(&frame, &layout, position, packet.output, injection)
-                        .await?;
-                    flow.spoofed |= spoofed;
-                    debug!(protocol = ?Protocol::Tls, "TCP data segmented");
-                    return Ok(action);
+                    return Ok(Action::Split {
+                        layout,
+                        offset: position,
+                        injection,
+                    });
                 }
                 return Ok(Action::Accept);
             }
@@ -724,55 +750,15 @@ impl Spoof {
         connection.write_tls(&mut payload)?;
         Ok(payload)
     }
-}
 
-impl Sender {
-    fn new(enabled: bool) -> Result<Self> {
-        let spoof = enabled.then(Spoof::new).transpose()?;
-        let mut seed = [0; 4];
-        rustls::crypto::aws_lc_rs::default_provider()
-            .secure_random
-            .fill(&mut seed)
-            .map_err(|error| {
-                anyhow::anyhow!("packet identification initialization failed: {error:?}")
-            })?;
-        let sockets: Result<Vec<_>> = [Domain::IPV4, Domain::IPV6]
-            .into_iter()
-            .map(|domain| {
-                let socket = Socket::new(
-                    domain,
-                    Type::RAW,
-                    Some(SocketProtocol::from(libc::IPPROTO_RAW)),
-                )?;
-                socket.set_nonblocking(true)?;
-                socket.set_mark(GENERATED)?;
-                if domain == Domain::IPV4 {
-                    socket.set_header_included_v4(true)?;
-                } else {
-                    socket.set_header_included_v6(true)?;
-                }
-                Ok(AsyncFd::new(socket)?)
-            })
-            .collect();
-        let mut sockets = sockets?.into_iter();
-        Ok(Self {
-            ipv4: sockets.next().expect("IPv4 socket"),
-            ipv6: sockets.next().expect("IPv6 socket"),
-            identification: AtomicU32::new(u32::from_be_bytes(seed)),
-            spoof,
-        })
-    }
-
-    fn spoof(
+    fn prepare(
         &self,
         frame: &Frame<'_>,
         hello: &Hello,
         flow: &Flow,
         offset: u64,
     ) -> Result<Option<Injection>> {
-        let (Some(spoof), Some(peer), Some((sequence, reference))) =
-            (&self.spoof, &flow.peer, flow.position)
-        else {
+        let (Some(peer), Some((sequence, reference))) = (&flow.peer, flow.position) else {
             return Ok(None);
         };
         let Some(acknowledged) = peer.acknowledged else {
@@ -781,7 +767,7 @@ impl Sender {
         let TransportHeader::Tcp(original) = &frame.transport else {
             return Ok(None);
         };
-        let mut payload = spoof.payload()?;
+        let mut payload = self.payload()?;
         let length = payload.len();
         let prefix = hello.position <= acknowledged
             && offset >= hello.position
@@ -818,22 +804,24 @@ impl Sender {
             offset: prefix.then_some(acknowledged.saturating_sub(offset) as usize),
         }))
     }
+}
 
-    async fn inject(
+impl Injection {
+    async fn send(
         &self,
         frame: &Frame<'_>,
         original: &TcpHeader,
-        injection: &Injection,
+        sender: &Sender,
         interface: u32,
         corrupt: bool,
     ) -> Result<()> {
         let (sequence, payload) = if corrupt {
-            (injection.start, &injection.payload[..injection.length])
+            (self.start, &self.payload[..self.length])
         } else {
-            (injection.sequence, injection.payload.as_slice())
+            (self.sequence, self.payload.as_slice())
         };
         let mut sent = 0;
-        for chunk in payload.rchunks(injection.maximum).rev() {
+        for chunk in payload.rchunks(self.maximum).rev() {
             let last = sent + chunk.len() == payload.len();
             let sequence = sequence.wrapping_add(sent as u32);
             let mut tcp = TcpHeader::new(
@@ -846,28 +834,47 @@ impl Sender {
             tcp.ack = true;
             tcp.psh = last;
             tcp.options = original.options.clone();
-            self.segment(frame, tcp, chunk, interface, corrupt).await?;
+            sender
+                .segment(frame, tcp, chunk, interface, corrupt)
+                .await?;
             sent += chunk.len();
         }
         debug!("TLS ClientHello spoofed");
         Ok(())
     }
+}
 
-    async fn split(
+impl Layout {
+    fn normalize(&mut self) {
+        self.cuts.sort_unstable();
+        self.cuts.dedup();
+        self.hosts
+            .sort_unstable_by_key(|(host, range)| (*host, range.start));
+        self.hosts.dedup_by(|(host, range), (previous, before)| {
+            if host == previous && range.start <= before.end {
+                before.end = before.end.max(range.end);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    async fn send(
         &self,
         frame: &Frame<'_>,
-        layout: &Layout,
+        sender: &Sender,
+        spoof: Option<&Spoof>,
         offset: u64,
         interface: u32,
         injection: Option<Injection>,
-    ) -> Result<Action> {
+    ) -> Result<Verdict> {
         let TransportHeader::Tcp(original) = &frame.transport else {
-            return Ok(Action::Accept);
+            return Ok(Verdict::Accept);
         };
         let mut positions = vec![0];
         positions.extend(
-            layout
-                .cuts
+            self.cuts
                 .iter()
                 .filter_map(|&cut| cut.checked_sub(offset))
                 .filter_map(|cut| usize::try_from(cut).ok())
@@ -875,8 +882,8 @@ impl Sender {
         );
         positions.push(frame.payload.len());
         let mut hosts = Vec::new();
-        if let Some(spoof) = &self.spoof {
-            for parts in layout.hosts.chunk_by(|left, right| left.0 == right.0) {
+        if let Some(spoof) = spoof {
+            for parts in self.hosts.chunk_by(|left, right| left.0 == right.0) {
                 let ranges: Vec<_> = parts
                     .iter()
                     .filter_map(|(_, range)| {
@@ -929,7 +936,8 @@ impl Sender {
         positions.sort_unstable();
         positions.dedup();
         if let Some(mut injection) = injection {
-            self.inject(frame, original, &injection, interface, true)
+            injection
+                .send(frame, original, sender, interface, true)
                 .await?;
             if let Some(start) = injection.offset {
                 let end = positions
@@ -943,11 +951,12 @@ impl Sender {
                     .payload
                     .extend_from_slice(&frame.payload[start..end]);
             }
-            self.inject(frame, original, &injection, interface, false)
+            injection
+                .send(frame, original, sender, interface, false)
                 .await?;
         }
         if positions.len() == 2 && hosts.is_empty() {
-            return Ok(Action::Accept);
+            return Ok(Verdict::Accept);
         }
         for index in 0..positions.len() - 1 {
             let index = if hosts.is_empty() {
@@ -959,7 +968,8 @@ impl Sender {
             if let Some((_, tcp, payload)) =
                 hosts.iter().find(|(range, _, _)| range.start == span[0])
             {
-                self.segment(frame, tcp.clone(), payload, interface, true)
+                sender
+                    .segment(frame, tcp.clone(), payload, interface, true)
                     .await?;
             }
             let mut tcp = original.clone();
@@ -971,21 +981,60 @@ impl Sender {
                 tcp.urgent_pointer = tcp.urgent_pointer.saturating_sub(span[0] as u16);
                 tcp.urg = tcp.urgent_pointer != 0;
             }
-            self.segment(
-                frame,
-                tcp,
-                &frame.payload[span[0]..span[1]],
-                interface,
-                false,
-            )
-            .await?;
+            sender
+                .segment(
+                    frame,
+                    tcp,
+                    &frame.payload[span[0]..span[1]],
+                    interface,
+                    false,
+                )
+                .await?;
             if let Some((_, tcp, payload)) = hosts.iter().find(|(range, _, _)| range.end == span[1])
             {
-                self.segment(frame, tcp.clone(), payload, interface, true)
+                sender
+                    .segment(frame, tcp.clone(), payload, interface, true)
                     .await?;
             }
         }
-        Ok(Action::Drop)
+        debug!("TCP data segmented");
+        Ok(Verdict::Drop)
+    }
+}
+
+impl Sender {
+    fn new() -> Result<Self> {
+        let mut seed = [0; 4];
+        rustls::crypto::aws_lc_rs::default_provider()
+            .secure_random
+            .fill(&mut seed)
+            .map_err(|error| {
+                anyhow::anyhow!("packet identification initialization failed: {error:?}")
+            })?;
+        let sockets: Result<Vec<_>> = [Domain::IPV4, Domain::IPV6]
+            .into_iter()
+            .map(|domain| {
+                let socket = Socket::new(
+                    domain,
+                    Type::RAW,
+                    Some(SocketProtocol::from(libc::IPPROTO_RAW)),
+                )?;
+                socket.set_nonblocking(true)?;
+                socket.set_mark(GENERATED)?;
+                if domain == Domain::IPV4 {
+                    socket.set_header_included_v4(true)?;
+                } else {
+                    socket.set_header_included_v6(true)?;
+                }
+                Ok(AsyncFd::new(socket)?)
+            })
+            .collect();
+        let mut sockets = sockets?.into_iter();
+        Ok(Self {
+            ipv4: sockets.next().expect("IPv4 socket"),
+            ipv6: sockets.next().expect("IPv6 socket"),
+            identification: AtomicU32::new(u32::from_be_bytes(seed)),
+        })
     }
 
     async fn segment(
