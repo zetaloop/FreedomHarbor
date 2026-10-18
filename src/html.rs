@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    io::Cursor,
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -20,6 +21,7 @@ use crate::{probe::Rule, sample::Record};
 pub enum Coding {
     Gzip,
     Deflate,
+    Zlib,
     Brotli,
     Zstd,
 }
@@ -41,7 +43,7 @@ pub fn codings(headers: &HeaderMap) -> Option<Vec<Coding>> {
         for coding in value.to_str().ok()?.split(',').map(str::trim) {
             result.push(match coding.to_ascii_lowercase().as_str() {
                 "gzip" | "x-gzip" => Coding::Gzip,
-                "deflate" => Coding::Deflate,
+                "deflate" => Coding::Zlib,
                 "br" => Coding::Brotli,
                 "zstd" => Coding::Zstd,
                 "identity" => continue,
@@ -65,14 +67,28 @@ pub async fn rewrite(
 ) -> Result<()> {
     let mut reader: Reader = Box::pin(BufReader::new(input));
     let mut writer: Writer = Box::pin(output);
-    for coding in codings.iter().rev() {
+    for mut coding in codings.into_iter().rev() {
+        if matches!(coding, Coding::Zlib) {
+            let mut header = Vec::new();
+            reader.as_mut().take(2).read_to_end(&mut header).await?;
+            // RFC 1950 identifies zlib streams through the CMF and FLG bytes.
+            if header.len() == 2
+                && (header[0] & 0x0f != 8
+                    || header[0] >> 4 > 7
+                    || !u16::from_be_bytes([header[0], header[1]]).is_multiple_of(31))
+            {
+                coding = Coding::Deflate;
+            }
+            reader = Box::pin(Cursor::new(header).chain(reader));
+        }
         reader = match coding {
             Coding::Gzip => {
                 let mut decoder = bufread::GzipDecoder::new(reader);
                 decoder.multiple_members(true);
                 Box::pin(BufReader::new(decoder))
             }
-            Coding::Deflate => Box::pin(BufReader::new(bufread::ZlibDecoder::new(reader))),
+            Coding::Deflate => Box::pin(BufReader::new(bufread::DeflateDecoder::new(reader))),
+            Coding::Zlib => Box::pin(BufReader::new(bufread::ZlibDecoder::new(reader))),
             Coding::Brotli => Box::pin(BufReader::new(bufread::BrotliDecoder::new(reader))),
             Coding::Zstd => {
                 let mut decoder = bufread::ZstdDecoder::new(reader);
@@ -82,7 +98,8 @@ pub async fn rewrite(
         };
         writer = match coding {
             Coding::Gzip => Box::pin(write::GzipEncoder::new(writer)),
-            Coding::Deflate => Box::pin(write::ZlibEncoder::new(writer)),
+            Coding::Deflate => Box::pin(write::DeflateEncoder::new(writer)),
+            Coding::Zlib => Box::pin(write::ZlibEncoder::new(writer)),
             Coding::Brotli => Box::pin(write::BrotliEncoder::new(writer)),
             Coding::Zstd => Box::pin(write::ZstdEncoder::new(writer)),
         };

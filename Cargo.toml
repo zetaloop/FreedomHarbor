@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-async-compression = { version = "0.4.50", features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
+async-compression = { version = "0.4.50", features = ["tokio", "gzip", "zlib", "brotli", "zstd", "deflate"] }
 clap = { version = "4.6.7", features = ["derive"] }
 encoding_rs = "0.8.42"
 etherparse = "0.21.0"
