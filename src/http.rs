@@ -95,6 +95,7 @@ impl Service<Uri> for Connector {
 }
 
 struct Clients {
+    initial: Initial,
     plain: [PlainClient; 2],
     secure: Option<[(SecureClient, https::Connector); 2]>,
 }
@@ -179,24 +180,17 @@ impl Http {
                         proxied,
                     })
                 });
-                Clients { plain, secure }
+                Arc::new(Clients {
+                    initial: Arc::clone(&initial),
+                    plain,
+                    secure,
+                })
             });
-            let proxied = request.version() != Version::HTTP_2 && request.uri().scheme().is_some();
-            let switching = request.headers().contains_key(UPGRADE);
-            let plain = clients.plain[usize::from(proxied)].clone();
-            let secure = clients
-                .secure
-                .as_ref()
-                .filter(|_| !proxied)
-                .map(|clients| clients[usize::from(!switching)].clone());
+            let clients = Arc::clone(clients);
             let http = Arc::clone(&self);
-            let initial = Arc::clone(&initial);
 
             async move {
-                let response = match http
-                    .forward(request, source, destination, initial, plain, secure)
-                    .await
-                {
+                let response = match http.forward(request, source, destination, clients).await {
                     Ok(response) => response,
                     Err(error) => {
                         warn!(%destination, ?error, "HTTP request failed");
@@ -227,14 +221,19 @@ impl Http {
         mut request: Request<Incoming>,
         source: SocketAddr,
         destination: SocketAddr,
-        initial: Initial,
-        plain: PlainClient,
-        secure: Option<(SecureClient, https::Connector)>,
+        clients: Arc<Clients>,
     ) -> Result<Response<ResponseBody>> {
+        let proxied = request.version() != Version::HTTP_2 && request.uri().scheme().is_some();
+        let http2 = !request.headers().contains_key(UPGRADE);
         let connect = request.method() == Method::CONNECT;
         let extended = request.extensions().get::<hyper::ext::Protocol>().is_some();
-        let switching = connect || request.headers().contains_key(UPGRADE);
+        let switching = connect || connection_upgrade(request.headers());
         let client_upgrade = switching.then(|| upgrade::on(&mut request));
+        let secure = clients
+            .secure
+            .as_ref()
+            .filter(|_| !proxied)
+            .map(|clients| &clients[usize::from(http2)]);
         let mut parts = request.uri().clone().into_parts();
         let host = match &parts.authority {
             Some(authority) => authority.clone(),
@@ -275,9 +274,9 @@ impl Http {
             if let Some(user_agent) = &self.user_agent {
                 normalize(request.headers_mut(), user_agent);
             }
-            plain.request(request).await
+            clients.plain[usize::from(proxied)].request(request).await
         };
-        let (mut response, encrypted) = if let Some((secure, mut connector)) = secure
+        let (mut response, encrypted) = if let Some((secure, connector)) = secure
             && (!connect || extended)
             && request.uri().scheme() == Some(&Scheme::HTTP)
         {
@@ -293,8 +292,12 @@ impl Http {
                     .get("upgrade-insecure-requests")
                     .is_some_and(|value| value == "1");
             if redirect {
-                if connector.available(&uri).await {
-                    initial.lock().expect("connection lock poisoned").take();
+                if connector.clone().available(&uri).await {
+                    clients
+                        .initial
+                        .lock()
+                        .expect("connection lock poisoned")
+                        .take();
                     let mut response = Response::new(body::empty());
                     *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
                     response
@@ -319,7 +322,11 @@ impl Http {
                 }
                 match secure.request(encrypted).await {
                     Ok(response) => {
-                        initial.lock().expect("connection lock poisoned").take();
+                        clients
+                            .initial
+                            .lock()
+                            .expect("connection lock poisoned")
+                            .take();
                         debug!(%host, "using HTTPS upstream");
                         (response, true)
                     }
@@ -405,8 +412,23 @@ fn normalize(headers: &mut HeaderMap, user_agent: &HeaderValue) {
     *headers = normalized;
 }
 
+fn connection_upgrade(headers: &HeaderMap) -> bool {
+    headers.contains_key(UPGRADE)
+        && headers.get_all(CONNECTION).iter().any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        })
+}
+
 fn hop_headers(headers: &mut HeaderMap, request: bool) -> Result<()> {
-    let upgrade = headers.get(UPGRADE).cloned();
+    let upgrades: Vec<_> = if connection_upgrade(headers) {
+        headers.get_all(UPGRADE).iter().cloned().collect()
+    } else {
+        Vec::new()
+    };
     let trailers = request
         && headers.get_all(TE).iter().any(|value| {
             value.to_str().is_ok_and(|value| {
@@ -434,9 +456,11 @@ fn hop_headers(headers: &mut HeaderMap, request: bool) -> Result<()> {
     }
     headers.remove("keep-alive");
     headers.remove("proxy-connection");
-    if let Some(upgrade) = upgrade {
+    if !upgrades.is_empty() {
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-        headers.insert(UPGRADE, upgrade);
+        for upgrade in upgrades {
+            headers.append(UPGRADE, upgrade);
+        }
     }
     if trailers {
         headers.insert(TE, HeaderValue::from_static("trailers"));
