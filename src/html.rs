@@ -16,7 +16,7 @@ use lol_html::{
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream};
 use tracing::debug;
 
-use crate::{probe::Rule, sample::Record};
+use crate::probe::{Record, Rule};
 
 pub enum Coding {
     Gzip,

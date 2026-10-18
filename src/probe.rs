@@ -1,27 +1,33 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{
-    HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version,
     header::{CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
 };
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body as _, Frame, Incoming};
 use lol_html::Selector;
 use regex::{Regex, RegexSet};
+use serde::Serialize;
 use tokio::{
     io::{AsyncWriteExt, DuplexStream},
     sync::oneshot,
 };
 use tokio_util::io::ReaderStream;
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::{
     body::{self, ResponseBody},
     config, html,
-    sample::{Record, Sample},
+    sample::Sample,
 };
 
 pub struct Rule {
@@ -42,6 +48,69 @@ pub struct Exchange {
     pub record: Arc<Record>,
     pub rules: Vec<Arc<Rule>>,
     pub blocked: bool,
+}
+
+#[derive(Serialize)]
+pub struct Hit {
+    pub rule: String,
+    pub action: &'static str,
+}
+
+pub struct Record {
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub uri: String,
+    pub method: Method,
+    pub version: Version,
+    pub headers: HeaderMap,
+    time: SystemTime,
+    hits: Mutex<Vec<Hit>>,
+}
+
+impl Record {
+    pub fn new<B>(request: &Request<B>, source: SocketAddr, destination: SocketAddr) -> Arc<Self> {
+        Arc::new(Self {
+            source,
+            destination,
+            uri: request.uri().to_string(),
+            method: request.method().clone(),
+            version: request.version(),
+            headers: request.headers().clone(),
+            time: SystemTime::now(),
+            hits: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn hit(&self, rule: &str, action: &'static str) {
+        let mut hits = self.hits.lock().expect("record lock poisoned");
+        if hits
+            .iter()
+            .any(|hit| hit.rule == rule && hit.action == action)
+        {
+            return;
+        }
+        hits.push(Hit {
+            rule: rule.into(),
+            action,
+        });
+        info!(source = %self.source, destination = %self.destination, uri = %self.uri, rule, action, "probe matched");
+    }
+
+    pub fn matched(&self) -> bool {
+        !self.hits.lock().expect("record lock poisoned").is_empty()
+    }
+
+    pub fn metadata(&self, complete: bool, error: Option<String>) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(&serde_json::json!({
+            "time": self.time,
+            "source": self.source,
+            "destination": self.destination,
+            "uri": self.uri,
+            "hits": *self.hits.lock().expect("record lock poisoned"),
+            "complete": complete,
+            "error": error,
+        }))?)
+    }
 }
 
 impl Probe {
@@ -99,24 +168,25 @@ impl Probe {
         }
     }
 
-    pub async fn block(&self, body: Incoming, exchange: &Exchange) -> Response<ResponseBody> {
-        let sample = self.sample(&exchange.record, None).await;
+    pub fn block(&self, body: Incoming, exchange: &Exchange) -> Response<ResponseBody> {
+        let directory = self.samples.clone();
         let record = Arc::clone(&exchange.record);
         tokio::spawn(async move {
-            let mut sample = sample;
+            let mut sample = Self::sample(directory, &record, None).await;
             let result = receive(body, None, &mut sample, &record).await;
-            finish(sample, &record, &result, None).await;
+            let error = result.as_ref().err().map(ToString::to_string);
+            finish(sample, &record, result.ok(), error).await;
         });
         blocked()
     }
 
-    pub async fn response(
+    pub fn response(
         &self,
         response: Response<Incoming>,
         exchange: Exchange,
-    ) -> Result<Response<ResponseBody>> {
+    ) -> Response<ResponseBody> {
         let (mut parts, body) = response.into_parts();
-        let original = parts.clone();
+        let original = self.samples.as_ref().map(|_| parts.clone());
         let Exchange { record, rules, .. } = exchange;
         cookies(&mut parts.headers, SET_COOKIE, &rules, &record);
         let redirect = parts
@@ -146,19 +216,17 @@ impl Probe {
         let filtering = codings.is_some();
 
         if !record.matched() && codings.is_none() {
-            return Ok(Response::from_parts(
-                parts,
-                body.map_err(anyhow::Error::from).boxed_unsync(),
-            ));
+            return Response::from_parts(parts, body.map_err(anyhow::Error::from).boxed_unsync());
         }
-        let sample = self.sample(&record, Some(&original)).await;
+        let directory = self.samples.clone();
         if redirect {
             tokio::spawn(async move {
-                let mut sample = sample;
+                let mut sample = Self::sample(directory, &record, original).await;
                 let result = receive(body, None, &mut sample, &record).await;
-                finish(sample, &record, &result, None).await;
+                let error = result.as_ref().err().map(ToString::to_string);
+                finish(sample, &record, result.ok(), error).await;
             });
-            return Ok(blocked());
+            return blocked();
         }
         if codings.is_some() {
             for name in [
@@ -178,7 +246,7 @@ impl Probe {
         let (writer, output) = tokio::io::duplex(8192);
         let (send, completion) = oneshot::channel();
         tokio::spawn(async move {
-            let mut sample = sample;
+            let mut sample = Self::sample(directory, &record, original).await;
             let incoming = receive(body, Some(input), &mut sample, &record);
             let outgoing = async {
                 if let Some(codings) = codings {
@@ -200,8 +268,14 @@ impl Probe {
                 }
             };
             let (incoming, outgoing) = tokio::join!(incoming, outgoing);
-            let error = outgoing.as_ref().err().map(ToString::to_string);
-            finish(sample, &record, &incoming, error).await;
+            let trailers = sample
+                .as_ref()
+                .and_then(|_| incoming.as_ref().ok().cloned());
+            let error = outgoing
+                .as_ref()
+                .err()
+                .or_else(|| incoming.as_ref().err())
+                .map(ToString::to_string);
             let result = incoming.and_then(|mut trailers| {
                 outgoing?;
                 if filtering {
@@ -218,6 +292,7 @@ impl Probe {
                 Ok(trailers)
             });
             let _ = send.send(result);
+            finish(sample, &record, trailers, error).await;
         });
         let data = ReaderStream::new(output)
             .map_ok(Frame::data)
@@ -230,16 +305,16 @@ impl Probe {
         })
         .try_filter_map(futures_util::future::ok);
         let body = StreamBody::new(data.chain(tail)).boxed_unsync();
-        Ok(Response::from_parts(parts, body))
+        Response::from_parts(parts, body)
     }
 
     async fn sample(
-        &self,
+        directory: Option<PathBuf>,
         record: &Arc<Record>,
-        response: Option<&http::response::Parts>,
+        response: Option<http::response::Parts>,
     ) -> Option<Sample> {
-        let directory = self.samples.as_ref()?;
-        match Sample::new(directory, record, response).await {
+        let directory = directory?;
+        match Sample::new(&directory, record, response.as_ref()).await {
             Ok(sample) => Some(sample),
             Err(error) => {
                 warn!(path = %directory.display(), ?error, "failed to create probe sample");
@@ -328,15 +403,25 @@ async fn receive(
     while let Some(frame) = body.frame().await {
         match frame?.into_data() {
             Ok(data) => {
-                if let Some(capture) = sample.as_mut()
-                    && let Err(error) = capture.write(&data).await
-                {
+                let (written, saved) = tokio::join!(
+                    async {
+                        match output.as_mut() {
+                            Some(writer) => writer.write_all(&data).await,
+                            None => Ok(()),
+                        }
+                    },
+                    async {
+                        match sample.as_mut() {
+                            Some(capture) => capture.write(&data).await,
+                            None => Ok(()),
+                        }
+                    },
+                );
+                if let Err(error) = saved {
                     warn!(uri = %record.uri, ?error, "failed to write probe sample");
                     *sample = None;
                 }
-                if let Some(writer) = output.as_mut()
-                    && let Err(error) = writer.write_all(&data).await
-                {
+                if let Err(error) = written {
                     output = None;
                     if sample.is_none() || !record.matched() {
                         return Err(error.into());
@@ -356,16 +441,14 @@ async fn receive(
 async fn finish(
     sample: Option<Sample>,
     record: &Record,
-    incoming: &Result<HeaderMap>,
+    trailers: Option<HeaderMap>,
     error: Option<String>,
 ) {
-    if let Some(sample) = sample {
-        let error = error.or_else(|| incoming.as_ref().err().map(ToString::to_string));
-        if let Err(error) = sample
-            .finish(incoming.is_ok(), incoming.as_ref().ok(), error)
+    if let Some(sample) = sample
+        && let Err(error) = sample
+            .finish(trailers.is_some(), trailers.as_ref(), error)
             .await
-        {
-            warn!(uri = %record.uri, ?error, "failed to save probe sample");
-        }
+    {
+        warn!(uri = %record.uri, ?error, "failed to save probe sample");
     }
 }

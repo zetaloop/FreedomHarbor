@@ -1,79 +1,12 @@
-use std::{
-    net::SocketAddr,
-    path::Path,
-    sync::{Arc, Mutex},
-    time::SystemTime,
-};
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
-use http::{HeaderMap, Method, Request, Version};
-use serde::Serialize;
+use http::HeaderMap;
 use tempfile::TempDir;
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::{info, warn};
 
-#[derive(Serialize)]
-pub struct Hit {
-    pub rule: String,
-    pub action: &'static str,
-}
-
-pub struct Record {
-    pub source: SocketAddr,
-    pub destination: SocketAddr,
-    pub uri: String,
-    method: Method,
-    version: Version,
-    headers: HeaderMap,
-    time: SystemTime,
-    hits: Mutex<Vec<Hit>>,
-}
-
-impl Record {
-    pub fn new<B>(request: &Request<B>, source: SocketAddr, destination: SocketAddr) -> Arc<Self> {
-        Arc::new(Self {
-            source,
-            destination,
-            uri: request.uri().to_string(),
-            method: request.method().clone(),
-            version: request.version(),
-            headers: request.headers().clone(),
-            time: SystemTime::now(),
-            hits: Mutex::new(Vec::new()),
-        })
-    }
-
-    pub fn hit(&self, rule: &str, action: &'static str) {
-        let mut hits = self.hits.lock().expect("sample lock poisoned");
-        if hits
-            .iter()
-            .any(|hit| hit.rule == rule && hit.action == action)
-        {
-            return;
-        }
-        hits.push(Hit {
-            rule: rule.into(),
-            action,
-        });
-        info!(source = %self.source, destination = %self.destination, uri = %self.uri, rule, action, "probe matched");
-    }
-
-    pub fn matched(&self) -> bool {
-        !self.hits.lock().expect("sample lock poisoned").is_empty()
-    }
-
-    fn metadata(&self, complete: bool, error: Option<String>) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec_pretty(&serde_json::json!({
-            "time": self.time,
-            "source": self.source,
-            "destination": self.destination,
-            "uri": self.uri,
-            "hits": *self.hits.lock().expect("sample lock poisoned"),
-            "complete": complete,
-            "error": error,
-        }))?)
-    }
-}
+use crate::probe::Record;
 
 pub struct Sample {
     directory: Option<TempDir>,

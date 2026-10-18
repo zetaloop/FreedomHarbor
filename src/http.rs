@@ -265,8 +265,7 @@ impl Http {
                 .probe
                 .as_ref()
                 .expect("probe enabled")
-                .block(request.into_body(), exchange)
-                .await);
+                .block(request.into_body(), exchange));
         }
         hop_headers(request.headers_mut(), true)?;
         let request = request.map(Body::new);
@@ -360,7 +359,7 @@ impl Http {
             });
         }
         let mut response = match (&self.probe, exchange) {
-            (Some(probe), Some(exchange)) => probe.response(response, exchange).await?,
+            (Some(probe), Some(exchange)) => probe.response(response, exchange),
             _ => response.map(|body| body.map_err(anyhow::Error::from).boxed_unsync()),
         };
         hop_headers(response.headers_mut(), false)?;
