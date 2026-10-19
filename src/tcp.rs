@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures_util::TryFutureExt;
 use hyper::body::Bytes;
 use socket2::{Domain, SockRef, Socket, Type};
 use tokio::{
@@ -141,7 +142,7 @@ async fn forward(
         let forwarding = released && !probe.candidate();
         tokio::select! {
             result = &mut connecting, if upstream.is_none() => {
-                upstream = Some(result?);
+                upstream = Some(result.context("connect upstream")?);
                 debug!(%destination, "connected");
             }
             state = ready(
@@ -149,7 +150,7 @@ async fn forward(
                 !forwarding || request.sent == request.data.len(),
                 forwarding && response.sent < response.data.len(),
             ) => {
-                let state = state?;
+                let state = state.context("poll client")?;
                 if state.is_readable() {
                     match client.try_read(&mut buffer) {
                         Ok(0) => decision = Some(Protocol::Tcp),
@@ -159,15 +160,15 @@ async fn forward(
                             decision = probe.feed(&buffer[..count]);
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(error).context("read client"),
                     }
                 }
                 if decision.is_none() && !probe.candidate() && state.is_writable() && response.sent < response.data.len() {
                     match client.try_write(&response.data[response.sent..]) {
-                        Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)).context("write client"),
                         Ok(count) => response.sent += count,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(error).context("write client"),
                     }
                 }
             }
@@ -176,7 +177,7 @@ async fn forward(
                 !forwarding || response.sent == response.data.len(),
                 forwarding && request.sent < request.data.len(),
             ) => {
-                let state = state?;
+                let state = state.context("poll upstream")?;
                 let stream = upstream.as_ref().expect("upstream ready");
                 if state.is_readable() {
                     match stream.try_read(&mut buffer) {
@@ -191,15 +192,15 @@ async fn forward(
                             };
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(error).context("read upstream"),
                     }
                 }
                 if decision.is_none() && state.is_writable() && request.sent < request.data.len() {
                     match stream.try_write(&request.data[request.sent..]) {
-                        Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)).context("write upstream"),
                         Ok(count) => request.sent += count,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(error).context("write upstream"),
                     }
                 }
             }
@@ -230,7 +231,7 @@ async fn forward(
     if decision != Some(Protocol::Http) {
         let mut upstream = match upstream {
             Some(stream) => stream,
-            None => connecting.await?,
+            None => connecting.await.context("connect upstream")?,
         };
         let (client_read, client_write) = client.split();
         let (upstream_read, upstream_write) = upstream.split();
@@ -239,12 +240,14 @@ async fn forward(
                 client_read,
                 upstream_write,
                 Bytes::from(request.data).slice(request.sent..),
-            ),
+            )
+            .map_err(|error| error.context("client to upstream")),
             transfer(
                 upstream_read,
                 client_write,
                 Bytes::from(response.data).slice(response.sent..),
-            ),
+            )
+            .map_err(|error| error.context("upstream to client")),
         )?;
         debug!(
             %destination,
@@ -265,30 +268,27 @@ async fn forward(
         .await
 }
 
-async fn transfer(
-    reader: ReadHalf<'_>,
-    mut writer: WriteHalf<'_>,
-    prefix: Bytes,
-) -> io::Result<u64> {
+async fn transfer(reader: ReadHalf<'_>, mut writer: WriteHalf<'_>, prefix: Bytes) -> Result<u64> {
     let mut total = prefix.len() as u64;
-    writer.write_all(&prefix).await?;
+    writer.write_all(&prefix).await.context("write prefix")?;
     drop(prefix);
 
     let source = reader.as_ref();
-    if source.peek(&mut [0]).await? == 0 {
-        writer.shutdown().await?;
+    if source.peek(&mut [0]).await.context("read")? == 0 {
+        writer.shutdown().await.context("shutdown write")?;
         return Ok(total);
     }
 
-    let (pipe_read, pipe_write) = io::pipe()?;
+    let (pipe_read, pipe_write) = io::pipe().context("create pipe")?;
     loop {
         let mut pending = source
             .async_io(Interest::READABLE, || {
                 splice(source.as_fd(), pipe_write.as_fd(), isize::MAX as usize)
             })
-            .await?;
+            .await
+            .context("read")?;
         if pending == 0 {
-            writer.shutdown().await?;
+            writer.shutdown().await.context("shutdown write")?;
             return Ok(total);
         }
 
@@ -298,9 +298,10 @@ async fn transfer(
                 .async_io(Interest::WRITABLE, || {
                     splice(pipe_read.as_fd(), destination.as_fd(), pending)
                 })
-                .await?;
+                .await
+                .context("write")?;
             if count == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
+                return Err(io::Error::from(io::ErrorKind::WriteZero)).context("write");
             }
             pending -= count;
             total += count as u64;
