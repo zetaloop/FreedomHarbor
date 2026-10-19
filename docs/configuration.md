@@ -75,6 +75,7 @@
 | `queue` | `200` | NFQUEUE 编号，与 nftables 的 `qnum` 对应 |
 | `http` | `true` | HTTP 请求的字段分段 |
 | `tls` | `true` | TLS ClientHello 的字段分段 |
+| `mmtls` | `true` | MMTLS 记录头的 TCP 分段 |
 | `quic` | `true` | QUIC Initial 的 CRYPTO 帧重封装与 IP 分片 |
 | `spoof` | `true` | 伪握手与域名片段注入 |
 

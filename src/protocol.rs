@@ -26,6 +26,7 @@ pub enum Probe {
         length: usize,
     },
     Tls(usize),
+    Mmtls(usize),
     Method(Option<usize>),
     Target(bool),
     Scheme,
@@ -81,7 +82,7 @@ impl Probe {
                     data[length] = byte;
                     let length = length + 1;
                     match mmtls::hello(&data[..length]) {
-                        Ok(()) => Self::Done(Protocol::Mmtls),
+                        Ok(length) => Self::Mmtls(length),
                         Err(Parse::Incomplete) => Self::Record { tls, data, length },
                         Err(Parse::Invalid) => Self::Done(Protocol::Tcp),
                     }
@@ -139,11 +140,14 @@ impl Probe {
                         Self::Version(position + 1)
                     }
                 }
+                Self::Mmtls(length) => Self::Mmtls(length),
                 Self::Done(protocol) => Self::Done(protocol),
                 _ => Self::Done(Protocol::Tcp),
             };
-            if let Self::Done(protocol) = *self {
-                return Some(protocol);
+            match *self {
+                Self::Mmtls(_) => return Some(Protocol::Mmtls),
+                Self::Done(protocol) => return Some(protocol),
+                _ => {}
             }
         }
         None

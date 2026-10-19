@@ -14,7 +14,7 @@ pub fn record(data: &[u8]) -> Result<usize, Parse> {
     Ok(5 + usize::from(u16::from_be_bytes([header[3], header[4]])))
 }
 
-pub fn hello(data: &[u8]) -> Result<(), Parse> {
+pub fn hello(data: &[u8]) -> Result<usize, Parse> {
     let length = record(data)?;
     if !matches!(data[0], 0x16 | 0x19) || length < 12 {
         return Err(Parse::Invalid);
@@ -25,5 +25,5 @@ pub fn hello(data: &[u8]) -> Result<(), Parse> {
     {
         return Err(Parse::Invalid);
     }
-    Ok(())
+    Ok(length)
 }

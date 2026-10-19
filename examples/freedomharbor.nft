@@ -36,8 +36,8 @@ table inet freedomharbor {
         # Sequence-space transitions keep TCP stream offsets observable.
         oifname $wan ct direction original meta l4proto tcp ct mark & $sequence == 0 tcp sequence & $sequence != 0 queue num $qnum
         oifname $wan ct direction original meta l4proto tcp ct mark & $sequence != 0 tcp sequence & $sequence == 0 queue num $qnum
-        # HTTP token prefixes and TLS handshake records.
-        oifname $wan ct direction original meta l4proto tcp @ih,0,8 { 9-13, 22, 32-33, 35-39, 42-43, 45-46, 48-57, 65-90, 94-122, 124, 126 } queue num $qnum
+        # HTTP token prefixes and handshake records.
+        oifname $wan ct direction original meta l4proto tcp @ih,0,8 { 9-13, 22, 25, 32-33, 35-39, 42-43, 45-46, 48-57, 65-90, 94-122, 124, 126 } queue num $qnum
         oifname $wan ct direction original meta l4proto udp @th,64,8 & 0x80 != 0 @th,72,32 { 0x00000001, 0x6b3343cf } queue num $qnum
     }
 

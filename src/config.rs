@@ -113,6 +113,7 @@ pub struct Packet {
     pub queue: u16,
     pub http: bool,
     pub tls: bool,
+    pub mmtls: bool,
     pub quic: bool,
     pub spoof: bool,
 }
@@ -123,6 +124,7 @@ impl Default for Packet {
             queue: 200,
             http: true,
             tls: true,
+            mmtls: true,
             quic: true,
             spoof: true,
         }

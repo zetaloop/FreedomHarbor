@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::Packet,
+    mmtls,
     netfilter::{self, Connection, Event, Queue, Verdict},
     protocol::{Parse, Probe, Protocol},
     quic,
@@ -79,6 +80,8 @@ struct Request {
 
 enum Header {
     Request(Probe),
+    Record([u8; 5], usize),
+    Payload(u64),
     Name(usize),
     Value,
     Host {
@@ -143,44 +146,90 @@ impl Request {
         }
     }
 
-    fn feed(&mut self, position: u64, data: &[u8]) -> Layout {
+    fn feed(&mut self, position: u64, data: &[u8], config: &Packet) -> Layout {
         let mut layout = Layout {
             range: position..position + data.len() as u64,
             ..Layout::default()
         };
         if position > self.position {
-            // Packet filtering can skip unclassified stream data.
-            *self = Self::new(position);
+            if matches!(self.header, Header::Payload(end) if position <= end) {
+                self.position = position;
+            } else {
+                // Packet filtering can skip unclassified stream data.
+                *self = Self::new(position);
+            }
         }
-        let Some(data) = data.get((self.position - position) as usize..) else {
+        let Some(mut data) = data.get((self.position - position) as usize..) else {
             return layout;
         };
         let begin = self.position;
-        if matches!(
-            self.header,
-            Header::Request(Probe::Done(Protocol::Tcp | Protocol::Mmtls))
-        ) {
+        let end = begin + data.len() as u64;
+        if matches!(self.header, Header::Request(Probe::Done(Protocol::Tcp))) {
             self.start = begin;
             self.header = Header::Request(Probe::new(true, false));
         }
-        for &byte in data {
+        while let Some((&byte, rest)) = data.split_first() {
+            if matches!(self.header, Header::Payload(end) if self.position == end) {
+                self.start = self.position;
+                self.header = Header::Record([0; 5], 0);
+            }
+            if matches!(self.header, Header::Record(_, 0)) && !matches!(byte, 0x15..=0x19) {
+                self.start = self.position;
+                self.header = Header::Request(Probe::new(true, false));
+            }
             let position = self.position;
             self.position += 1;
+            data = rest;
             match &mut self.header {
-                Header::Request(probe) => match probe.feed(std::slice::from_ref(&byte)) {
-                    Some(Protocol::Http) => {
-                        layout.cuts.push(self.start + 2);
-                        self.header = Header::Name(0);
+                Header::Request(probe) => {
+                    match (probe.feed(std::slice::from_ref(&byte)), &*probe) {
+                        (Some(Protocol::Http), _) => {
+                            if config.http {
+                                layout.cuts.push(self.start + 2);
+                            }
+                            self.header = Header::Name(0);
+                        }
+                        (Some(Protocol::Mmtls), Probe::Mmtls(length)) => {
+                            if config.mmtls {
+                                layout.cuts.push(self.start + 2);
+                            }
+                            self.header = Header::Payload(self.start + *length as u64);
+                        }
+                        (Some(_), _) => break,
+                        (None, _) => {}
                     }
-                    Some(_) => break,
-                    None => {}
-                },
+                }
+                Header::Record(header, length) => {
+                    header[*length] = byte;
+                    *length += 1;
+                    match mmtls::record(&header[..*length]) {
+                        Ok(length) => {
+                            self.header = Header::Payload(self.start + length as u64);
+                        }
+                        Err(Parse::Incomplete) => {
+                            if *length == 3 && config.mmtls {
+                                layout.cuts.push(self.start + 2);
+                            }
+                        }
+                        Err(Parse::Invalid) => {
+                            self.header = Header::Request(Probe::Done(Protocol::Tcp));
+                            break;
+                        }
+                    }
+                }
+                Header::Payload(end) => {
+                    let count = (*end - self.position).min(data.len() as u64) as usize;
+                    self.position += count as u64;
+                    data = &data[count..];
+                }
                 Header::Name(0) if byte == b'\r' => self.header = Header::End,
                 Header::Name(0) | Header::End if byte == b'\n' => {
                     self.start = self.position;
                     self.header = Header::Request(Probe::new(true, false));
                 }
-                Header::Name(index) if byte.eq_ignore_ascii_case(&b"host:"[*index]) => {
+                Header::Name(index)
+                    if config.http && byte.eq_ignore_ascii_case(&b"host:"[*index]) =>
+                {
                     *index += 1;
                     if *index == 5 {
                         self.header = Header::Value;
@@ -243,11 +292,16 @@ impl Request {
         }
         if let Header::Request(probe) = &self.header
             && probe.candidate()
+            && if matches!(probe, Probe::Record { .. }) {
+                config.mmtls
+            } else {
+                config.http
+            }
             && self.start + 2 > begin
         {
             layout.cuts.push(self.start + 2);
         }
-        self.position = begin + data.len() as u64;
+        self.position = end;
         for &cut in &layout.cuts {
             layout.range.start = layout.range.start.min(cut.saturating_sub(1));
         }
@@ -496,16 +550,23 @@ fn process(
                 .layouts
                 .iter()
                 .any(|layout| position < layout.range.end && end > layout.range.start);
-            let mut layout = if config.http
+            let mut layout = if (config.http || config.mmtls)
                 && flow.hello.is_none()
                 && flow.server.is_none()
                 && (flow.request.is_some() || !known)
-                && !matches!(frame.payload.first(), Some(20 | 22))
-            {
+                && (!matches!(frame.payload.first(), Some(20 | 22))
+                    || flow.request.as_ref().is_some_and(|request| {
+                        matches!(
+                            request.header,
+                            Header::Record(..)
+                                | Header::Payload(_)
+                                | Header::Request(Probe::Record { .. })
+                        )
+                    })) {
                 let layout = flow
                     .request
                     .get_or_insert_with(|| Request::new(position))
-                    .feed(position, frame.payload);
+                    .feed(position, frame.payload, config);
                 if !layout.cuts.is_empty() || !layout.hosts.is_empty() {
                     flow.layouts.push(Layout {
                         range: layout.range.clone(),
@@ -577,6 +638,38 @@ fn process(
                 }
                 hello.packets.drain(..consumed);
                 layout.range = hello.position..hello.position + hello.data.len() as u64;
+                if config.mmtls {
+                    match mmtls::hello(&hello.data) {
+                        Ok(_) => {
+                            let mut request = Request::new(hello.position);
+                            let layout = request.feed(hello.position, &hello.data, config);
+                            flow.request = Some(request);
+                            flow.mark = (flow.mark & !STATE) | HANDSHAKE;
+                            flow.layouts.push(Layout {
+                                range: layout.range.clone(),
+                                cuts: layout.cuts.clone(),
+                                hosts: layout.hosts.clone(),
+                            });
+                            return Ok(Action::Split {
+                                layout,
+                                offset: position,
+                                injection: None,
+                            });
+                        }
+                        Err(Parse::Incomplete) => {
+                            if hello.data.len() >= 3 {
+                                layout.cuts.push(hello.position + 2);
+                            }
+                            flow.hello = Some(hello);
+                            return Ok(Action::Split {
+                                layout,
+                                offset: position,
+                                injection: None,
+                            });
+                        }
+                        Err(Parse::Invalid) => {}
+                    }
+                }
                 layout.cuts = tls::start(&hello.data)
                     .ok()
                     .filter(|_| config.tls)
