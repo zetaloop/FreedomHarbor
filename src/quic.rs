@@ -11,7 +11,7 @@ use rustls::{
 };
 use tracing::debug;
 
-use crate::tls::{ClientHello, Parse};
+use crate::{protocol::Parse, tls::ClientHello};
 
 const LIMIT: u64 = 1 << 62;
 

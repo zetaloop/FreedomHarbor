@@ -26,8 +26,8 @@ use tracing::{debug, info, warn};
 use crate::{
     config::Config,
     http::Http,
-    protocol::{self, Probe, Protocol},
-    tls::{Parse, Records},
+    protocol::{self, Parse, Probe, Protocol},
+    tls::Records,
 };
 
 pub type Connecting = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
@@ -222,6 +222,9 @@ async fn forward(
     if let Some(hello) = hello {
         debug!(%destination, "TLS detected");
         hello.fragment(&mut request.data);
+    }
+    if decision == Some(Protocol::Mmtls) {
+        debug!(%destination, "MMTLS detected");
     }
 
     if decision != Some(Protocol::Http) {

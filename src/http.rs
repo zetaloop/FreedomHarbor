@@ -269,6 +269,10 @@ impl Http {
         }
         hop_headers(request.headers_mut(), true)?;
         let request = request.map(Body::new);
+        let mmtls = secure.is_some()
+            && !connect
+            && request.uri().scheme() == Some(&Scheme::HTTP)
+            && request.body().protocol().await? == Protocol::Mmtls;
         let send = async |mut request: Request<Body>| {
             if let Some(user_agent) = &self.user_agent {
                 normalize(request.headers_mut(), user_agent);
@@ -276,6 +280,7 @@ impl Http {
             clients.plain[usize::from(proxied)].request(request).await
         };
         let (mut response, encrypted) = if let Some((secure, connector)) = secure
+            && !mmtls
             && (!connect || extended)
             && request.uri().scheme() == Some(&Scheme::HTTP)
         {

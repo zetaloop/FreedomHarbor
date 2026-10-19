@@ -1,13 +1,30 @@
+use crate::mmtls;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Protocol {
     Http,
     Tls,
+    Mmtls,
     Tcp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parse {
+    Incomplete,
+    Invalid,
+}
+
 pub enum Probe {
-    Start { http: bool, tls: bool },
+    Start {
+        http: bool,
+        tls: bool,
+    },
     Space,
+    Record {
+        tls: bool,
+        data: [u8; 12],
+        length: usize,
+    },
     Tls(usize),
     Method(Option<usize>),
     Target(bool),
@@ -25,23 +42,52 @@ impl Probe {
     pub fn candidate(&self) -> bool {
         matches!(
             self,
-            Self::Resource | Self::Version(_) | Self::Tls(3..) | Self::Done(Protocol::Tls)
+            Self::Resource
+                | Self::Version(_)
+                | Self::Record { length: 3.., .. }
+                | Self::Tls(3..)
+                | Self::Done(Protocol::Tls)
         )
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Option<Protocol> {
         for &byte in data {
             *self = match *self {
-                Self::Start { tls: true, .. } if byte == 0x16 => Self::Tls(1),
+                Self::Start { tls, .. } if matches!(byte, 0x16 | 0x19) => {
+                    let mut data = [0; 12];
+                    data[0] = byte;
+                    Self::Record {
+                        tls,
+                        data,
+                        length: 1,
+                    }
+                }
                 Self::Start { http: true, .. } | Self::Space if byte.is_ascii_whitespace() => {
                     Self::Space
                 }
                 Self::Start { http: true, .. } | Self::Space if token(byte) => {
                     Self::Method((byte == b'C').then_some(1))
                 }
+                Self::Record {
+                    tls: true,
+                    data,
+                    length: 1,
+                } if data[0] == 0x16 && byte == 3 => Self::Tls(2),
+                Self::Record {
+                    tls,
+                    mut data,
+                    length,
+                } => {
+                    data[length] = byte;
+                    let length = length + 1;
+                    match mmtls::hello(&data[..length]) {
+                        Ok(()) => Self::Done(Protocol::Mmtls),
+                        Err(Parse::Incomplete) => Self::Record { tls, data, length },
+                        Err(Parse::Invalid) => Self::Done(Protocol::Tcp),
+                    }
+                }
                 Self::Tls(position)
                     if match position {
-                        1 => byte == 3,
                         2 => byte <= 3,
                         3 | 4 => true,
                         5 => byte == 1,

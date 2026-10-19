@@ -29,9 +29,9 @@ use tracing::{debug, info, warn};
 use crate::{
     config::Packet,
     netfilter::{self, Connection, Event, Queue, Verdict},
-    protocol::{Probe, Protocol},
+    protocol::{Parse, Probe, Protocol},
     quic,
-    tls::{self, Parse, Records, ServerHello},
+    tls::{self, Records, ServerHello},
 };
 
 const GENERATED: u32 = 0x40000000;
@@ -156,7 +156,10 @@ impl Request {
             return layout;
         };
         let begin = self.position;
-        if matches!(self.header, Header::Request(Probe::Done(Protocol::Tcp))) {
+        if matches!(
+            self.header,
+            Header::Request(Probe::Done(Protocol::Tcp | Protocol::Mmtls))
+        ) {
             self.start = begin;
             self.header = Header::Request(Probe::new(true, false));
         }
