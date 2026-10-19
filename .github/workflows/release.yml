@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        type: string
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.arch }}-unknown-linux-musl
+      CC: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.CARGO_BUILD_TARGET }}
+          components: rustfmt, clippy
+      - name: Install musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build
+        run: |
+          cargo fmt --check
+          cargo clippy -- -D warnings
+          cargo build --release
+          "target/$CARGO_BUILD_TARGET/release/freedomharbor" --version
+      - name: Package
+        run: |
+          mkdir -p dist/freedomharbor
+          cp "target/$CARGO_BUILD_TARGET/release/freedomharbor" README.md LICENSE dist/freedomharbor/
+          cp -r docs examples dist/freedomharbor/
+          tar -C dist -czf "freedomharbor-linux-${{ matrix.arch }}.tar.gz" freedomharbor
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freedomharbor-linux-${{ matrix.arch }}
+          path: freedomharbor-linux-${{ matrix.arch }}.tar.gz
+
+  release:
+    needs: build
+    if: github.event_name == 'push' || inputs.tag != ''
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          files: "*.tar.gz"

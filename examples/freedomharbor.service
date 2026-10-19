@@ -1,0 +1,11 @@
+[Unit]
+Description=FreedomHarbor
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/freedomharbor -c /etc/freedomharbor.toml
+Restart=on-failure
+StateDirectory=freedomharbor
+
+[Install]
+WantedBy=multi-user.target
