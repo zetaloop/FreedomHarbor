@@ -1,113 +1,134 @@
-# 配置
+# Configuration
 
-使用 `-c` 指定 TOML 文件，省略的字段采用默认值。[程序配置示例](../examples/freedomharbor.toml)与[流量规则示例](../examples/freedomharbor.nft)配套使用。修改程序配置后重新启动进程；修改 nftables 规则后通过宿主的防火墙配置应用。
+Load a TOML file with `freedomharbor -c path/to/config.toml`. Omitted fields use their defaults. Restart FreedomHarbor after changing the configuration.
 
-`-v` 输出连接与报文处理的调试日志。
+The [example configuration](../examples/freedomharbor.toml) enables packet handling and uses the listener addresses expected by the [nftables rules](../examples/freedomharbor.nft).
 
 ## TCP
 
-顶层 `listen` 是透明 TCP 监听地址列表，默认为 `["127.0.0.1:15000", "[::1]:15000"]`。其端口与 nftables 示例中的 `port` 对应。
+These options are at the top level of the TOML file.
 
-顶层 `tls` 默认为 `true`，将连接开头的 ClientHello 分为多条 TLS 记录。`sniff_timeout_ms` 默认为 `10`，控制模糊协议前缀的缓冲时间；到期后开始转发并继续识别。
+| Option | Default | Description |
+|---|---|---|
+| `listen` | `["127.0.0.1:15000", "[::1]:15000"]` | Transparent TCP listeners. Match these to the TPROXY targets in the nftables rules. |
+| `tls` | `true` | Split the initial TLS ClientHello across multiple TLS records. |
+| `sniff_timeout_ms` | `10` | How long to buffer TCP data while its application protocol is unclear, in milliseconds. Detection continues after forwarding starts. |
+
+Recognizable HTTP, TLS and MMTLS prefixes are buffered until enough data is available for parsing. The top-level `tls` option changes TLS record boundaries; `packet.tls` controls TCP segmentation.
 
 ## HTTP
 
-在 `[http]` 中设置：
+Options under `[http]`:
 
-| 字段 | 默认值 | 作用 |
+| Option | Default | Description |
 |---|---|---|
-| `enabled` | `true` | 启用 HTTP 识别与请求响应处理 |
-| `upgrade` | `true` | 自动尝试 HTTPS 上游；关闭后沿原 HTTP 方式发送请求 |
-| `normalize` | `true` | 规范化明文出站请求的设备身份、来源信息与字段形式 |
-| `user_agent` | 随包提供的 Chrome 桌面 UA | 规范化使用的统一 User-Agent |
-| `tls_timeout_ms` | `3000` | HTTPS 上游建立连接的超时时间 |
-| `cache_ttl_ms` | `300000` | HTTPS 可用性结果的缓存时间 |
+| `enabled` | `true` | Parse and handle HTTP requests and responses. |
+| `upgrade` | `true` | Attempt HTTPS upstream connections for HTTP requests. |
+| `normalize` | `true` | Normalize request headers on plaintext HTTP upstream connections. |
+| `user_agent` | Bundled Chrome desktop UA | User-Agent used by header normalization. |
+| `tls_timeout_ms` | `3000` | HTTPS connection timeout, in milliseconds. |
+| `cache_ttl_ms` | `300000` | Lifetime of cached HTTPS connection results, in milliseconds. |
 
-时间字段的单位为毫秒。HTTPS 上游连接建立失败时使用 HTTP；携带 `Upgrade-Insecure-Requests: 1` 的普通 GET／HEAD 请求可在 HTTPS 可用时收到 307 重定向。
+Header normalization replaces `User-Agent` and sorts header names. It removes `Sec-CH-*`, device and network hints, and the forwarding headers `Forwarded`, `Via`, `X-Forwarded-For` and `X-Real-IP`. Responses from plaintext upstreams have `Accept-CH` and `Critical-CH` removed.
 
-内置 UA 采用安卓 Chrome 桌面模式的格式。明文规范化会清除 Client Hints 与来源链信息；HTTPS 上游使用原业务字段。
+HTTPS upgrades connect to the original destination IP. An omitted port or port 80 maps to 443; other explicit ports are retained. If the HTTPS connection fails, the request uses HTTP.
 
-## 主动探针
+For ordinary GET and HEAD requests, `Upgrade-Insecure-Requests: 1` enables a 307 redirect when HTTPS is available. MMTLS carried over HTTP uses its original HTTP endpoint.
 
-在 `[http.probe]` 中设置：
+## Content rules
 
-| 字段 | 默认值 | 作用 |
+Options under `[http.probe]`:
+
+| Option | Default | Description |
 |---|---|---|
-| `enabled` | `true` | 启用探针内容规则，需要同时启用 HTTP 处理 |
-| `capture` | `true` | 保存命中留样；关闭后继续执行过滤和记录命中日志 |
-| `samples` | `/var/lib/freedomharbor/samples` | 样本存放目录，进程需要写入权限 |
-| `rules` | 内置 `usershare` 规则 | 通过 `[[http.probe.rules]]` 提供的列表替换内置规则 |
+| `enabled` | `true` | Apply content rules to traffic handled by the HTTP proxy. |
+| `capture` | `true` | Save samples when a content rule matches. |
+| `samples` | `/var/lib/freedomharbor/samples` | Directory for saved samples. |
+| `rules` | Built-in `usershare` rule | List of filtering rules. |
 
-每条规则的字段如下：
+The built-in rule matches the `/usershare/flash.js` and `/usershare/1.swf` resources, related embedded elements and inline detection scripts. Defining `[[http.probe.rules]]` entries replaces the default list.
 
-| 字段 | 作用 |
+Each rule requires a `name`. Its match lists default to empty.
+
+| Field | Description |
 |---|---|
-| `name` | 日志和样本中的规则名称 |
-| `scope` | 当前请求 URL 的正则；省略时适用于所有请求 |
-| `urls` | 阻断的资源 URL 正则列表，也匹配响应中的重定向目标 |
-| `elements` | 移除 HTML 元素的 CSS 选择器列表 |
-| `scripts` | 清除内联 `script` 内容的正则列表 |
-| `cookies` | Cookie 名称正则列表，清除请求 Cookie 与响应 Set-Cookie 中的匹配项 |
+| `name` | Rule name used in logs and sample metadata. |
+| `scope` | Regular expression selecting request URLs. Omit to apply the rule to all requests. |
+| `urls` | Patterns matched against request URLs and response `Location` headers. Matching requests and redirects return an empty 204 response. |
+| `elements` | CSS selectors for HTML elements to remove. |
+| `scripts` | Patterns matched against inline script text. The contents of a matching script are removed. |
+| `cookies` | Cookie name patterns to remove from request `Cookie` and response `Set-Cookie` headers. |
 
-`name` 为必填项，其余列表默认为空。符合 `scope` 的规则共同生效。匹配的资源请求与重定向返回 204；元素规则移除对应节点及内容，脚本规则清除没有 `src` 属性的匹配内联脚本文本。
+`scope`, `urls`, `scripts` and `cookies` use Rust regular expressions. All rules whose scope matches the request apply.
 
-### 留样
+This example applies a rule to `example.com`:
 
-开启 `capture` 后，待检查的 HTML 正文会随接收过程写入临时文件，命中后保存为样本。每份样本使用一个目录：
+```toml
+[[http.probe.rules]]
+name = "site-probe"
+scope = '^https?://example\.com/'
+urls = ['/probe\.js(?:[?#]|$)']
+elements = ['script[src*="/probe.js"]']
+scripts = ['\bcheckClient\s*\(']
+cookies = ['^client_probe$']
+```
 
-| 文件 | 内容 |
+HTML filtering supports gzip, deflate, Brotli and Zstandard content encodings. Filtered bodies are encoded in the same format as the input.
+
+### Samples
+
+With `capture` enabled, matched HTTP exchanges are saved under `samples`. Response bodies are stored as received, including their original content encoding.
+
+| File | Contents |
 |---|---|
-| `request.headers` | 关联请求的方法、URL、协议版本与处理前的请求头 |
-| `response.headers` | 处理前的响应状态与响应头 |
-| `response.body` | 保留原内容编码的响应正文 |
-| `request.body` | 被阻断资源请求的正文 |
-| `trailers.headers` | 收到的尾部字段 |
-| `event.json` | 来源、目标、命中规则及接收结果 |
+| `request.headers` | Request method, URL, HTTP version and headers before filtering. |
+| `response.headers` | Response status and headers before filtering. |
+| `request.body` | Body of a blocked request. |
+| `response.body` | Response body before filtering. |
+| `trailers.headers` | Trailers received with the body. |
+| `event.json` | Time, source, destination, URL, rule matches and completion details. |
 
-文件随实际收到的内容生成。`event.json` 中的 `complete` 表示正文是否接收完整，`error` 记录中断或处理异常。
+In `event.json`, `complete` indicates whether the entire body was received. `error` describes any interruption or processing failure.
 
-## 报文策略
+## Packet handling
 
-添加 `[packet]` 后启用报文处理。该配置与 nftables 中的队列规则配套启用或停用。
+Adding `[packet]` enables NFQUEUE processing. Include this table when using the supplied nftables rules.
 
-| 字段 | 默认值 | 作用 |
+| Option | Default | Description |
 |---|---|---|
-| `queue` | `200` | NFQUEUE 编号，与 nftables 的 `qnum` 对应 |
-| `http` | `true` | HTTP 请求的字段分段 |
-| `tls` | `true` | TLS ClientHello 的字段分段 |
-| `mmtls` | `true` | MMTLS 记录头的 TCP 分段 |
-| `quic` | `true` | QUIC Initial 的 CRYPTO 帧重封装与 IP 分片 |
-| `spoof` | `true` | 伪握手与域名片段注入 |
+| `queue` | `200` | NFQUEUE number. Match it to `qnum` in the nftables rules. |
+| `http` | `true` | Split the HTTP method and `Host` header across TCP segments. |
+| `tls` | `true` | Split TCP segments around TLS ClientHello fields. |
+| `mmtls` | `true` | Split TCP segments at MMTLS record headers. |
+| `quic` | `true` | Reorder QUIC Initial CRYPTO frames and use IP fragmentation when needed. |
+| `spoof` | `true` | Inject decoy TLS ClientHellos and hostname fragments. |
 
-QUIC 按 SNI 与 ECH 位置拆分、排列 CRYPTO 帧，并使用原有 PADDING 容纳首部。空间不足时发送原数据报的 IP 分片。
+## nftables rules
 
-伪 ClientHello 使用统一的 TLS 配置，随机字段按连接生成。发送器先发送校验和失配的副本，再将同一份伪内容放在对端已确认的序号范围内；与真实片段相接时，通过窗口前缀合包发送。报文长度按握手中协商的 MSS 分段。
+The example redirects WAN-bound TCP connections from the LAN to the proxy. It uses NFQUEUE for packet-level handling of TCP and QUIC traffic.
 
-HTTP Host 与 TLS SNI 按字段范围穿插同长度的伪域名片段，顺序为真实前缀、伪域名、真实域名、相同的伪域名、真实后缀。伪片段使用错误的 TCP 校验和。字段跨 TCP 包或 TLS 记录时，逐段处理已收到的内容，TLS 记录首部沿用原字节。
+Variables in `examples/freedomharbor.nft`:
 
-## 流量规则
-
-`examples/freedomharbor.nft` 中的变量控制流量导入和报头处理：
-
-| 变量 | 示例值 | 作用 |
+| Variable | Example | Description |
 |---|---|---|
-| `lan` | `lan0` | LAN 入站接口 |
-| `wan` | `wan0` | WAN 出站接口 |
-| `port` | `15000` | 透明 TCP 投递端口，对应程序的 `listen` |
-| `qnum` | `200` | 报文队列编号，对应 `packet.queue` |
-| `hops` | `64` | LAN→WAN 转发报文的 TTL／Hop Limit |
-| `intercept` | `0x1` | 透明投递标记，与策略路由的 `fwmark` 对应 |
-| `generated` | `0x40000000` | 程序的生成报文标记 |
-| `discard` | `0x08000000` | 由生成报文替代的原包标记 |
-| `handshake` | `0x10000000` | 等待服务端握手消息的连接标记 |
-| `established` | `0x20000000` | 已识别 TLS 服务端握手的连接标记 |
-| `sequence` | `0x80000000` | 出站 TCP 序号的高位 |
+| `lan` | `lan0` | LAN ingress interface. |
+| `wan` | `wan0` | WAN egress interface. |
+| `port` | `15000` | TCP proxy port, matching `listen`. |
+| `qnum` | `200` | NFQUEUE number, matching `packet.queue`. |
+| `hops` | `64` | TTL/Hop Limit for forwarded traffic. |
 
-示例使用路由表 `100` 将 `intercept` 标记的流量投递至本机。报文与连接状态标记对应程序使用的位分配。
+The routing commands in the README use mark `0x1` and table `100` to deliver traffic to the proxy.
 
-`freedomharbor_headers` 表负责转发报文的跳数、IPv4 IPID 和 IPv6 Flow Label。使用以下命令关闭或开启该表：
+The `freedomharbor_headers` table adjusts TTL/Hop Limit, IPv4 identification and IPv6 flow labels on forwarded traffic.
+
+Disable IP header normalization at runtime:
 
 ```sh
 sudo nft 'add table inet freedomharbor_headers { flags dormant; }'
+```
+
+Enable it again:
+
+```sh
 sudo nft add table inet freedomharbor_headers
 ```

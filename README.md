@@ -1,48 +1,35 @@
 # FreedomHarbor
 
-Linux 双栈透明流量处理工具。
+FreedomHarbor is a DPI evasion and traffic normalization tool for Linux gateways. It processes LAN traffic through a transparent TCP proxy and an NFQUEUE packet handler, with IPv4 and IPv6 support.
 
-## 准备
+- HTTP and IP header normalization, HTTP-to-HTTPS forwarding, and content filtering with sample capture.
+- TLS ClientHello record splitting and TCP segmentation, with decoy handshakes and hostname fragments.
+- QUIC v1/v2 Initial frame reordering and IP fragmentation.
+- MMTLS recognition over HTTP and raw TCP, with TCP segmentation at record headers.
 
-运行需要 Linux、nftables、iproute2 和系统 CA 证书。
+## Installation
 
-宿主负责 LAN／WAN 接口、地址、路由和转发设置，防火墙允许导入的 TCP 流量。
+Use a Linux gateway with working LAN and WAN connectivity and IP forwarding. The kernel needs TPROXY and NFQUEUE support. The runtime dependencies are nftables, iproute2 and a system CA certificate bundle.
 
-## 安装
-
-[Releases](https://github.com/zetaloop/FreedomHarbor/releases) 提供 Linux x86_64 与 aarch64 的 musl 静态构建。解压后安装程序：
+Download the x86_64 or aarch64 Linux archive from [Releases](https://github.com/zetaloop/FreedomHarbor/releases). From the extracted `freedomharbor` directory, install the binary:
 
 ```sh
 sudo install -m755 freedomharbor /usr/local/bin/freedomharbor
 ```
 
-### 源码构建
+For a source build, see [Building](#building).
 
-源码构建使用 Rust 与 C 编译工具链：
+## Gateway setup
 
-```sh
-cargo build --release
-sudo install -m755 target/release/freedomharbor /usr/local/bin/freedomharbor
-```
-
-发布前运行 `py scripts/user-agent.py`，从 Chrome 官方稳定版数据更新内置 UA。
-
-## 配置
-
-安装程序配置：
+Install the example configuration:
 
 ```sh
 sudo install -m644 examples/freedomharbor.toml /etc/freedomharbor.toml
 ```
 
-- [程序配置示例](examples/freedomharbor.toml)：设置监听地址和报文处理功能。
-- [流量规则示例](examples/freedomharbor.nft)：填写实际的 LAN／WAN 接口，与程序配置对应。
+The example enables packet handling on NFQUEUE 200 and listens on `127.0.0.1:15000` and `[::1]:15000`. Set `lan` and `wan` in [`examples/freedomharbor.nft`](examples/freedomharbor.nft) to the gateway's interface names.
 
-各项参数、开关和规则的作用见[配置说明](docs/configuration.md)。
-
-## 启动
-
-加载示例所需的策略路由与 nftables 规则，并通过宿主网络配置持久化：
+These commands route marked TCP traffic to the local proxy and load the rules:
 
 ```sh
 sudo ip rule add fwmark 0x1 lookup 100
@@ -52,16 +39,33 @@ sudo ip -6 route add local default dev lo table 100
 sudo nft -f examples/freedomharbor.nft
 ```
 
-前台运行：
+The route commands apply to the current boot. For automatic startup, add these routes to the gateway's network configuration and load the rules through its firewall service.
+
+## Running
+
+Run in the foreground:
 
 ```sh
 sudo freedomharbor -c /etc/freedomharbor.toml
 ```
 
-使用 systemd 服务：
+Or install the systemd unit:
 
 ```sh
 sudo install -m644 examples/freedomharbor.service /etc/systemd/system/freedomharbor.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now freedomharbor
 ```
+
+Use `-v` for debug logs. Configuration options and filtering rules are described in the [configuration reference](docs/configuration.md).
+
+## Building
+
+Source builds need Rust and a C compiler:
+
+```sh
+cargo build --release
+sudo install -m755 target/release/freedomharbor /usr/local/bin/freedomharbor
+```
+
+Continue with [Gateway setup](#gateway-setup). The bundled User-Agent can be refreshed from the latest stable Android Chrome version with `python3 scripts/user-agent.py`.

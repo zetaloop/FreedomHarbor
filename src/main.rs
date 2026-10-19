@@ -27,12 +27,15 @@ use tracing::Level;
 use config::Config;
 
 #[derive(Parser)]
-#[command(version, about = "Linux 透明流量处理工具")]
+#[command(
+    version,
+    about = "DPI evasion and traffic normalization for Linux gateways"
+)]
 struct Args {
-    #[arg(short, long, help = "配置文件路径")]
+    #[arg(short, long, help = "TOML configuration file")]
     config: Option<PathBuf>,
 
-    #[arg(short, long, help = "显示连接日志")]
+    #[arg(short, long, help = "Enable debug logging")]
     verbose: bool,
 }
 
