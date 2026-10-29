@@ -12,6 +12,7 @@ pub struct ClientHello {
     pub sni: Option<Range<usize>>,
     pub ech: Option<Range<usize>>,
     pub ready: bool,
+    mmtls: bool,
 }
 
 pub struct Records {
@@ -45,6 +46,7 @@ impl ClientHello {
             sni: None,
             ech: None,
             ready: false,
+            mmtls: false,
         };
         match reader.fields(&mut hello) {
             Ok(()) => hello.ready = true,
@@ -106,6 +108,10 @@ impl Records {
     }
 
     pub fn fragment(&self, data: &mut Vec<u8>) {
+        // MMTLS peers expect an intact ClientHello record.
+        if self.hello.mmtls {
+            return;
+        }
         for position in [self.split, self.position(6)].into_iter().flatten() {
             let Some((_, body)) = self
                 .records
@@ -201,6 +207,8 @@ impl<F: FnMut(usize) -> Result<u8, Parse>> Reader<F> {
                 }
             } else if kind == 0xfe0d {
                 hello.ech.get_or_insert(start..extension.end);
+            } else if kind == 0xf1f1 {
+                hello.mmtls = true;
             }
             self.position = extension.end;
         }
