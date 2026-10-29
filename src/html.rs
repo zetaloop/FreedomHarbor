@@ -46,7 +46,7 @@ pub fn codings(headers: &HeaderMap) -> Option<Vec<Coding>> {
                 "deflate" => Coding::Zlib,
                 "br" => Coding::Brotli,
                 "zstd" => Coding::Zstd,
-                "identity" => continue,
+                "" | "identity" => continue,
                 _ => {
                     debug!(coding, "unrecognized HTML content encoding");
                     return None;
