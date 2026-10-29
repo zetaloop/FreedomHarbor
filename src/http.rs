@@ -188,12 +188,23 @@ impl Http {
             });
             let clients = Arc::clone(clients);
             let http = Arc::clone(&self);
+            let method = request.method().clone();
+            let uri = request.uri().clone();
+            let host = request.headers().get(HOST).cloned();
 
             async move {
                 let response = match http.forward(request, source, destination, clients).await {
                     Ok(response) => response,
                     Err(error) => {
-                        warn!(%destination, ?error, "HTTP request failed");
+                        warn!(
+                            %source,
+                            %destination,
+                            %method,
+                            %uri,
+                            host = host.as_ref().map(tracing::field::debug),
+                            ?error,
+                            "HTTP request failed"
+                        );
                         let mut response = Response::new(body::empty());
                         *response.status_mut() = StatusCode::BAD_GATEWAY;
                         response
@@ -359,7 +370,7 @@ impl Http {
                 }
                 .await;
                 if let Err(error) = result {
-                    warn!(?error, "HTTP tunnel failed");
+                    warn!(%source, %destination, %host, ?error, "HTTP tunnel failed");
                 }
             });
         }
