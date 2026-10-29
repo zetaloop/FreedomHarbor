@@ -189,12 +189,13 @@ impl Probe {
         let original = self.samples.as_ref().map(|_| parts.clone());
         let Exchange { record, rules, .. } = exchange;
         cookies(&mut parts.headers, SET_COOKIE, &rules, &record);
-        let redirect = parts
-            .headers
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|location| Url::parse(&record.uri).ok()?.join(location).ok())
-            .is_some_and(|location| match_url(location.as_str(), &rules, &record));
+        let redirect = parts.status.is_redirection()
+            && parts
+                .headers
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|location| Url::parse(&record.uri).ok()?.join(location).ok())
+                .is_some_and(|location| match_url(location.as_str(), &rules, &record));
         let media = parts
             .headers
             .get(CONTENT_TYPE)
