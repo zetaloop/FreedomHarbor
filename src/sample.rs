@@ -12,40 +12,35 @@ pub struct Sample {
     directory: Option<TempDir>,
     body: fs::File,
     record: Arc<Record>,
+    response: Option<http::response::Parts>,
 }
 
 impl Sample {
     pub async fn new(
         directory: &Path,
         record: &Arc<Record>,
-        response: Option<&http::response::Parts>,
+        response: Option<http::response::Parts>,
     ) -> Result<Self> {
-        fs::create_dir_all(directory).await?;
-        let directory = tempfile::Builder::new()
-            .prefix("event-")
-            .tempdir_in(directory)?;
-        let request = format!("{} {} {:?}\r\n", record.method, record.uri, record.version);
-        fs::write(
-            directory.path().join("request.headers"),
-            headers(&request, &record.headers),
-        )
-        .await?;
-        let name = if let Some(response) = response {
-            let status = format!("{:?} {}\r\n", response.version, response.status);
-            fs::write(
-                directory.path().join("response.headers"),
-                headers(&status, &response.headers),
-            )
-            .await?;
+        let name = if response.is_some() {
             "response.body"
         } else {
             "request.body"
         };
-        let body = fs::File::create(directory.path().join(name)).await?;
+        let directory = directory.to_owned();
+        let (directory, body) = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&directory)?;
+            let directory = tempfile::Builder::new()
+                .prefix("event-")
+                .tempdir_in(directory)?;
+            let body = std::fs::File::create(directory.path().join(name))?;
+            Ok::<_, std::io::Error>((directory, body))
+        })
+        .await??;
         Ok(Self {
             directory: Some(directory),
-            body,
+            body: fs::File::from_std(body),
             record: Arc::clone(record),
+            response,
         })
     }
 
@@ -57,23 +52,52 @@ impl Sample {
     pub async fn finish(
         mut self,
         complete: bool,
-        trailers: Option<&HeaderMap>,
+        trailers: Option<HeaderMap>,
         error: Option<String>,
     ) -> Result<()> {
         if !self.record.matched() {
             return Ok(());
         }
         self.body.flush().await?;
-        let directory = self.directory.as_ref().expect("sample directory").path();
+        tokio::task::spawn_blocking(move || {
+            let directory = self.directory.as_ref().expect("sample directory").path();
+            self.describe(directory, complete, trailers.as_ref(), error)?;
+            let directory = self.directory.take().expect("sample directory").keep();
+            info!(path = %directory.display(), "probe sample saved");
+            Ok(())
+        })
+        .await?
+    }
+
+    fn describe(
+        &self,
+        directory: &Path,
+        complete: bool,
+        trailers: Option<&HeaderMap>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let request = format!(
+            "{} {} {:?}\r\n",
+            self.record.method, self.record.uri, self.record.version
+        );
+        std::fs::write(
+            directory.join("request.headers"),
+            headers(&request, &self.record.headers),
+        )?;
+        if let Some(response) = &self.response {
+            let status = format!("{:?} {}\r\n", response.version, response.status);
+            std::fs::write(
+                directory.join("response.headers"),
+                headers(&status, &response.headers),
+            )?;
+        }
         if let Some(trailers) = trailers
             && !trailers.is_empty()
         {
-            fs::write(directory.join("trailers.headers"), headers("", trailers)).await?;
+            std::fs::write(directory.join("trailers.headers"), headers("", trailers))?;
         }
         let metadata = self.record.metadata(complete, error)?;
-        fs::write(directory.join("event.json"), metadata).await?;
-        let directory = self.directory.take().expect("sample directory").keep();
-        info!(path = %directory.display(), "probe sample saved");
+        std::fs::write(directory.join("event.json"), metadata)?;
         Ok(())
     }
 }
@@ -84,14 +108,12 @@ impl Drop for Sample {
             && self.record.matched()
         {
             let directory = directory.keep();
-            let result = self
-                .record
-                .metadata(false, Some("processing interrupted".into()))
-                .and_then(|metadata| {
-                    std::fs::write(directory.join("event.json"), metadata)?;
-                    Ok(())
-                });
-            if let Err(error) = result {
+            if let Err(error) = self.describe(
+                &directory,
+                false,
+                None,
+                Some("processing interrupted".into()),
+            ) {
                 warn!(path = %directory.display(), ?error, "failed to describe interrupted probe sample");
             }
             info!(path = %directory.display(), "partial probe sample saved");

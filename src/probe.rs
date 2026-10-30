@@ -315,7 +315,7 @@ impl Probe {
         response: Option<http::response::Parts>,
     ) -> Option<Sample> {
         let directory = directory?;
-        match Sample::new(&directory, record, response.as_ref()).await {
+        match Sample::new(&directory, record, response).await {
             Ok(sample) => Some(sample),
             Err(error) => {
                 warn!(path = %directory.display(), ?error, "failed to create probe sample");
@@ -446,9 +446,7 @@ async fn finish(
     error: Option<String>,
 ) {
     if let Some(sample) = sample
-        && let Err(error) = sample
-            .finish(trailers.is_some(), trailers.as_ref(), error)
-            .await
+        && let Err(error) = sample.finish(trailers.is_some(), trailers, error).await
     {
         warn!(uri = %record.uri, ?error, "failed to save probe sample");
     }
