@@ -358,15 +358,16 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
             }
             Event::Packet(mut packet) => {
                 let mut temporary = Flow::default();
-                let flow = match &packet.connection {
-                    Some(connection) => flows.entry(connection.clone()).or_insert_with(|| Flow {
+                let tracked = packet.connection.is_some();
+                let flow = match packet.connection.take() {
+                    Some(connection) => flows.entry(connection).or_insert_with(|| Flow {
                         mark: packet.connection_mark & MASK,
                         ..Flow::default()
                     }),
                     None => &mut temporary,
                 };
                 let frame = if packet.complete {
-                    match Frame::parse(&packet.data) {
+                    match Frame::parse(packet.data.nla_payload().as_ref()) {
                         Ok(frame) => frame,
                         Err(error) => {
                             warn!(?error, "packet processing failed");
@@ -386,7 +387,7 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
                         Action::Accept
                     }
                 };
-                if packet.connection.is_some() && flow.mark != packet.connection_mark & MASK {
+                if tracked && flow.mark != packet.connection_mark & MASK {
                     packet.update = Some((flow.mark, MASK));
                 }
                 match action {

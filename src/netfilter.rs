@@ -2,13 +2,13 @@ use std::{borrow::Cow, collections::VecDeque, io, io::Cursor};
 
 use anyhow::{Context, Result, ensure};
 use neli::{
-    FromBytesWithInput, ToBytes,
+    FromBytesWithInput, Size, ToBytes,
     consts::{
         alignto,
         nl::NlmF,
         socket::{Msg, NlFamily},
     },
-    genl::{AttrType, NlattrBuilder},
+    genl::{AttrType, Nlattr, NlattrBuilder},
     nl::{NlPayload, NlmsghdrBuilder},
     socket::NlSocket,
     types::{Buffer, GenlBuffer, NlBuffer},
@@ -58,7 +58,7 @@ pub struct Packet {
     pub connection_mark: u32,
     pub update: Option<(u32, u32)>,
     pub reply: bool,
-    pub data: Vec<u8>,
+    pub data: Nlattr<u16, Buffer>,
     pub complete: bool,
     pub checksum_ready: bool,
 }
@@ -157,17 +157,19 @@ impl Queue {
                         .context("incomplete packet identifier")?
                         .try_into()?,
                 );
-                let data = bytes(&attributes, PAYLOAD)
-                    .context("missing packet payload")?
-                    .to_vec();
+                let index = attributes
+                    .iter()
+                    .position(|attribute| *attribute.nla_type().nla_type() == PAYLOAD)
+                    .context("missing packet payload")?;
                 let tracking = bytes(&attributes, CONNECTION).map(parse).transpose()?;
                 self.events.push_back(Event::Packet(Packet {
                     id,
                     mark: integer(&attributes, MARK).unwrap_or_default(),
                     output: integer(&attributes, OUTPUT).unwrap_or_default(),
                     reply: matches!(integer(&attributes, CONNECTION_INFO), Some(3 | 4)),
-                    complete: integer(&attributes, CAPTURE_LENGTH)
-                        .is_none_or(|length| length as usize == data.len()),
+                    complete: integer(&attributes, CAPTURE_LENGTH).is_none_or(|length| {
+                        length as usize == attributes.as_ref()[index].nla_payload().len()
+                    }),
                     checksum_ready: integer(&attributes, SKB_INFO).unwrap_or_default()
                         & CHECKSUM_NOT_READY
                         == 0,
@@ -179,7 +181,7 @@ impl Queue {
                         .and_then(|attributes| integer(attributes, CONNECTION_MARK))
                         .unwrap_or_default(),
                     update: None,
-                    data,
+                    data: attributes.into_iter().nth(index).expect("packet payload"),
                 }));
             }
         }
@@ -266,7 +268,7 @@ async fn send(socket: &AsyncFd<NlSocket>, kind: u16, flags: NlmF, payload: Vec<u
         .nl_flags(flags)
         .nl_payload(NlPayload::Payload(Buffer::from(payload)))
         .build()?;
-    let mut bytes = Cursor::new(Vec::new());
+    let mut bytes = Cursor::new(Vec::with_capacity(message.padded_size()));
     message.to_bytes(&mut bytes)?;
     let bytes = bytes.into_inner();
     let count = socket
@@ -306,9 +308,10 @@ fn attribute(output: &mut Vec<u8>, kind: u16, payload: &[u8]) -> Result<()> {
         .nla_type(AttrType::<u16>::from(kind))
         .nla_payload(payload)
         .build()?;
-    let mut encoded = Cursor::new(Vec::new());
+    let mut encoded = Cursor::new(std::mem::take(output));
+    encoded.set_position(encoded.get_ref().len() as u64);
     attribute.to_bytes(&mut encoded)?;
-    output.extend_from_slice(encoded.get_ref());
+    *output = encoded.into_inner();
     Ok(())
 }
 
