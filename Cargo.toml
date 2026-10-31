@@ -20,6 +20,7 @@ lol_html = "3.0.1"
 mime = "0.3.17"
 moka = { version = "0.12.16", features = ["future"] }
 neli = { version = "0.7.4", default-features = false }
+quick-xml = { version = "0.42.0", features = ["async-tokio"] }
 regex = "1.13.1"
 rustls = "0.23.45"
 serde = { version = "1.0.229", features = ["derive"] }

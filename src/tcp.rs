@@ -28,6 +28,7 @@ use crate::{
     config::Config,
     http::Http,
     protocol::{self, Parse, Probe, Protocol},
+    starttls,
     tls::Records,
 };
 
@@ -136,6 +137,8 @@ async fn forward(
     let mut released = false;
     let mut decision = (!http.enabled && !tls).then_some(Protocol::Tcp);
     let mut hello = None;
+    let mut upgrade = None;
+    let mut closed = false;
     let mut buffer = [0; 8192];
 
     while decision.is_none() {
@@ -153,7 +156,10 @@ async fn forward(
                 let state = state.context("poll client")?;
                 if state.is_readable() {
                     match client.try_read(&mut buffer) {
-                        Ok(0) => decision = Some(Protocol::Tcp),
+                        Ok(0) => {
+                            closed = true;
+                            decision = Some(Protocol::Tcp);
+                        }
                         Ok(count) => {
                             deadline.get_or_insert_with(|| Instant::now() + timeout);
                             request.data.extend_from_slice(&buffer[..count]);
@@ -181,7 +187,10 @@ async fn forward(
                 let stream = upstream.as_ref().expect("upstream ready");
                 if state.is_readable() {
                     match stream.try_read(&mut buffer) {
-                        Ok(0) => decision = Some(Protocol::Tcp),
+                        Ok(0) => {
+                            closed = true;
+                            decision = Some(Protocol::Tcp);
+                        }
                         Ok(count) => {
                             deadline.get_or_insert_with(|| Instant::now() + timeout);
                             response.data.extend_from_slice(&buffer[..count]);
@@ -218,6 +227,15 @@ async fn forward(
                 Err(Parse::Invalid) => decision = Some(Protocol::Tcp),
             }
         }
+        if tls && !closed && decision == Some(Protocol::Tcp) {
+            released = true;
+            probe = Probe::Done(Protocol::Tcp);
+            match starttls::detect(&request.data, &response.data) {
+                Ok(protocol) => upgrade = protocol,
+                Err(Parse::Incomplete) => decision = None,
+                Err(Parse::Invalid) => {}
+            }
+        }
     }
 
     if let Some(hello) = hello {
@@ -233,26 +251,32 @@ async fn forward(
             Some(stream) => stream,
             None => connecting.await.context("connect upstream")?,
         };
-        let (client_read, client_write) = client.split();
-        let (upstream_read, upstream_write) = upstream.split();
-        let (forwarded, returned) = tokio::try_join!(
-            transfer(
-                client_read,
-                upstream_write,
-                Bytes::from(request.data).slice(request.sent..),
-            )
-            .map_err(|error| error.context("client to upstream")),
-            transfer(
-                upstream_read,
-                client_write,
-                Bytes::from(response.data).slice(response.sent..),
-            )
-            .map_err(|error| error.context("upstream to client")),
-        )?;
+        let sent = request.sent;
+        let received = response.sent;
+        let (forwarded, returned) = if let Some(protocol) = upgrade {
+            starttls::forward(protocol, &mut client, &mut upstream, request, response).await?
+        } else {
+            let (client_read, client_write) = client.split();
+            let (upstream_read, upstream_write) = upstream.split();
+            tokio::try_join!(
+                transfer(
+                    client_read,
+                    upstream_write,
+                    Bytes::from(request.data).slice(sent..),
+                )
+                .map_err(|error| error.context("client to upstream")),
+                transfer(
+                    upstream_read,
+                    client_write,
+                    Bytes::from(response.data).slice(received..),
+                )
+                .map_err(|error| error.context("upstream to client")),
+            )?
+        };
         debug!(
             %destination,
-            sent = forwarded + request.sent as u64,
-            received = returned + response.sent as u64,
+            sent = forwarded + sent as u64,
+            received = returned + received as u64,
             "connection closed"
         );
         return Ok(());
@@ -268,7 +292,11 @@ async fn forward(
         .await
 }
 
-async fn transfer(reader: ReadHalf<'_>, mut writer: WriteHalf<'_>, prefix: Bytes) -> Result<u64> {
+pub async fn transfer(
+    reader: ReadHalf<'_>,
+    mut writer: WriteHalf<'_>,
+    prefix: Bytes,
+) -> Result<u64> {
     let mut total = prefix.len() as u64;
     writer.write_all(&prefix).await.context("write prefix")?;
     drop(prefix);

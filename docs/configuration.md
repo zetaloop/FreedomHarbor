@@ -11,10 +11,12 @@ These options are at the top level of the TOML file.
 | Option | Default | Description |
 |---|---|---|
 | `listen` | `["127.0.0.1:15000", "[::1]:15000"]` | Transparent TCP listeners. Match these to the TPROXY targets in the nftables rules. |
-| `tls` | `true` | Split the initial TLS ClientHello across multiple TLS records. |
+| `tls` | `true` | Split TLS ClientHello messages across multiple TLS records. |
 | `sniff_timeout_ms` | `10` | How long to buffer TCP data while its application protocol is unclear, in milliseconds. Detection continues after forwarding starts. |
 
 Recognizable HTTP, TLS and MMTLS prefixes are buffered until enough data is available for parsing. The top-level `tls` option changes TLS record boundaries; `packet.tls` controls TCP segmentation.
+
+TLS record splitting applies to direct TLS and negotiated upgrades in SMTP/LMTP, POP3, IMAP, FTP, XMPP, LDAP, PostgreSQL and MySQL.
 
 ## HTTP
 
