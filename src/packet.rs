@@ -43,9 +43,6 @@ const SEQUENCE: u32 = 0x80000000;
 const STATE: u32 = HANDSHAKE | ESTABLISHED;
 const MASK: u32 = STATE | SEQUENCE;
 
-// Scaled TCP windows are smaller than 2^30 bytes.
-const ACK_OFFSET: u32 = 1 << 30;
-
 #[derive(Default)]
 struct Flow {
     quic: quic::State,
@@ -910,31 +907,28 @@ impl Injection {
         original: &TcpHeader,
         sender: &Sender,
         interface: u32,
-        corrupt: bool,
     ) -> Result<()> {
-        let (sequence, payload) = if corrupt {
-            (self.start, &self.payload[..self.length])
-        } else {
-            (self.sequence, self.payload.as_slice())
-        };
-        let mut sent = 0;
-        for chunk in payload.rchunks(self.maximum).rev() {
-            let last = sent + chunk.len() == payload.len();
-            let sequence = sequence.wrapping_add(sent as u32);
-            let mut tcp = TcpHeader::new(
-                original.source_port,
-                original.destination_port,
-                sequence,
-                original.window_size,
-            );
-            tcp.acknowledgment_number = original.acknowledgment_number.wrapping_add(ACK_OFFSET);
-            tcp.ack = true;
-            tcp.psh = last;
-            tcp.options = original.options.clone();
-            sender
-                .segment(frame, tcp, chunk, interface, corrupt)
-                .await?;
-            sent += chunk.len();
+        for (sequence, payload) in [
+            (self.start, &self.payload[..self.length]),
+            (self.sequence, self.payload.as_slice()),
+        ] {
+            let mut sent = 0;
+            for chunk in payload.rchunks(self.maximum).rev() {
+                let last = sent + chunk.len() == payload.len();
+                let sequence = sequence.wrapping_add(sent as u32);
+                let mut tcp = TcpHeader::new(
+                    original.source_port,
+                    original.destination_port,
+                    sequence,
+                    original.window_size,
+                );
+                tcp.acknowledgment_number = original.acknowledgment_number;
+                tcp.ack = true;
+                tcp.psh = last;
+                tcp.options = original.options.clone();
+                sender.segment(frame, tcp, chunk, interface, true).await?;
+                sent += chunk.len();
+            }
         }
         debug!("TLS ClientHello spoofed");
         Ok(())
@@ -1022,7 +1016,7 @@ impl Layout {
                     original.sequence_number.wrapping_add(range.start as u32),
                     original.window_size,
                 );
-                tcp.acknowledgment_number = original.acknowledgment_number.wrapping_add(ACK_OFFSET);
+                tcp.acknowledgment_number = original.acknowledgment_number;
                 tcp.ack = true;
                 tcp.psh = true;
                 tcp.options = original.options.clone();
@@ -1033,9 +1027,6 @@ impl Layout {
         positions.sort_unstable();
         positions.dedup();
         if let Some(mut injection) = injection {
-            injection
-                .send(frame, original, sender, interface, true)
-                .await?;
             if let Some(start) = injection.offset {
                 let end = positions
                     .iter()
@@ -1048,9 +1039,7 @@ impl Layout {
                     .payload
                     .extend_from_slice(&frame.payload[start..end]);
             }
-            injection
-                .send(frame, original, sender, interface, false)
-                .await?;
+            injection.send(frame, original, sender, interface).await?;
         }
         if positions.len() == 2 && hosts.is_empty() {
             return Ok(Verdict::Accept);
