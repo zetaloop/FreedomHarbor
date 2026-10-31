@@ -116,9 +116,7 @@ struct Spoof {
 
 struct Injection {
     sequence: u32,
-    start: u32,
     payload: Vec<u8>,
-    length: usize,
     maximum: usize,
     offset: Option<usize>,
 }
@@ -399,7 +397,7 @@ pub async fn run(config: Option<&Packet>) -> Result<()> {
                             .send(
                                 frame.as_ref().expect("parsed packet"),
                                 &sender,
-                                spoof.as_ref(),
+                                spoof.as_ref().map(|spoof| (spoof, &*flow)),
                                 offset,
                                 packet.output,
                                 injection,
@@ -886,14 +884,11 @@ impl Spoof {
             .checked_sub(extra)
             .context("TCP headers exceed MSS")?;
         ensure!(maximum != 0, "MSS has no payload space");
-        let start = hello.position + tls::start(&hello.data).expect("TLS record") as u64;
         Ok(Some(Injection {
-            start: sequence.wrapping_sub((reference - start) as u32),
             sequence: sequence
                 .wrapping_sub((reference - acknowledged) as u32)
                 .wrapping_sub(length as u32),
             payload,
-            length,
             maximum,
             offset: prefix.then_some(acknowledged.saturating_sub(offset) as usize),
         }))
@@ -908,27 +903,22 @@ impl Injection {
         sender: &Sender,
         interface: u32,
     ) -> Result<()> {
-        for (sequence, payload) in [
-            (self.start, &self.payload[..self.length]),
-            (self.sequence, self.payload.as_slice()),
-        ] {
-            let mut sent = 0;
-            for chunk in payload.rchunks(self.maximum).rev() {
-                let last = sent + chunk.len() == payload.len();
-                let sequence = sequence.wrapping_add(sent as u32);
-                let mut tcp = TcpHeader::new(
-                    original.source_port,
-                    original.destination_port,
-                    sequence,
-                    original.window_size,
-                );
-                tcp.acknowledgment_number = original.acknowledgment_number;
-                tcp.ack = true;
-                tcp.psh = last;
-                tcp.options = original.options.clone();
-                sender.segment(frame, tcp, chunk, interface, true).await?;
-                sent += chunk.len();
-            }
+        let mut sent = 0;
+        for chunk in self.payload.rchunks(self.maximum).rev() {
+            let last = sent + chunk.len() == self.payload.len();
+            let sequence = self.sequence.wrapping_add(sent as u32);
+            let mut tcp = TcpHeader::new(
+                original.source_port,
+                original.destination_port,
+                sequence,
+                original.window_size,
+            );
+            tcp.acknowledgment_number = original.acknowledgment_number;
+            tcp.ack = true;
+            tcp.psh = last;
+            tcp.options = original.options.clone();
+            sender.segment(frame, tcp, chunk, interface, true).await?;
+            sent += chunk.len();
         }
         debug!("TLS ClientHello spoofed");
         Ok(())
@@ -955,7 +945,7 @@ impl Layout {
         &self,
         frame: &Frame<'_>,
         sender: &Sender,
-        spoof: Option<&Spoof>,
+        spoof: Option<(&Spoof, &Flow)>,
         offset: u64,
         interface: u32,
         injection: Option<Injection>,
@@ -973,7 +963,10 @@ impl Layout {
         );
         positions.push(frame.payload.len());
         let mut hosts = Vec::new();
-        if let Some(spoof) = spoof {
+        if let Some((spoof, flow)) = spoof
+            && let Some((sequence, reference)) = flow.position
+            && let Some(acknowledged) = flow.peer.as_ref().and_then(|peer| peer.acknowledged)
+        {
             for parts in self.hosts.chunk_by(|left, right| left.0 == right.0) {
                 let ranges: Vec<_> = parts
                     .iter()
@@ -987,6 +980,10 @@ impl Layout {
                     continue;
                 };
                 let range = first.start..last.end;
+                let distance = reference - acknowledged + range.len() as u64;
+                if distance >= 1 << 31 {
+                    continue;
+                }
                 let mut payload = vec![0; range.len()];
                 spoof
                     .tls
@@ -1013,7 +1010,7 @@ impl Layout {
                 let mut tcp = TcpHeader::new(
                     original.source_port,
                     original.destination_port,
-                    original.sequence_number.wrapping_add(range.start as u32),
+                    sequence.wrapping_sub(distance as u32),
                     original.window_size,
                 );
                 tcp.acknowledgment_number = original.acknowledgment_number;
