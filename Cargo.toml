@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-async-compression = { version = "0.4.50", features = ["tokio", "gzip", "zlib", "brotli", "zstd", "deflate"] }
+async-compression = { version = "0.4.51", features = ["tokio", "gzip", "zlib", "brotli", "zstd", "deflate"] }
 clap = { version = "4.6.7", features = ["derive"] }
-encoding_rs = "0.8.42"
+encoding_rs = "0.8.44"
 etherparse = "0.21.0"
 futures-util = "0.3.34"
 http = "1.5.0"
@@ -15,19 +15,19 @@ http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "server", "http1", "http2"] }
 hyper-rustls = { version = "0.27.10", features = ["http2"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "server-auto", "http1", "http2", "tokio"] }
-libc = "0.2.190"
-lol_html = "3.0.1"
+libc = "0.2.191"
+lol_html = "3.0.3"
 mime = "0.3.17"
 moka = { version = "0.12.16", features = ["future"] }
-neli = { version = "0.7.4", default-features = false }
+neli = { version = "0.7.5", default-features = false }
 quick-xml = { version = "0.42.0", features = ["async-tokio"] }
 regex = "1.13.1"
-rustls = "0.23.45"
+rustls = "0.23.46"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 socket2 = { version = "0.6.5", features = ["all"] }
 tempfile = "3.27.0"
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "time", "sync", "fs"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "time", "sync", "fs"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 toml = "1.1.8"
 tower-service = "0.3.3"

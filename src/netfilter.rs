@@ -259,7 +259,8 @@ fn socket(groups: Groups) -> Result<AsyncFd<NlSocket>> {
     socket.nonblock()?;
     // The kernel's rmem_max determines the receive budget.
     socket.set_recv_buffer_size(i32::MAX as usize)?;
-    Ok(AsyncFd::new(socket)?)
+    // SAFETY: The owned socket keeps its descriptor throughout registration.
+    Ok(unsafe { AsyncFd::register(socket) }?)
 }
 
 async fn send(socket: &AsyncFd<NlSocket>, kind: u16, flags: NlmF, payload: Vec<u8>) -> Result<()> {

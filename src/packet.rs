@@ -1112,7 +1112,8 @@ impl Sender {
                 } else {
                     socket.set_header_included_v6(true)?;
                 }
-                Ok(AsyncFd::new(socket)?)
+                // SAFETY: The owned socket keeps its descriptor throughout registration.
+                Ok(unsafe { AsyncFd::register(socket) }?)
             })
             .collect();
         let mut sockets = sockets?.into_iter();
